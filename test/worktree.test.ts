@@ -271,4 +271,37 @@ describe('WorktreeManager', () => {
     // cleanup should also be non-fatal
     mgr.cleanup('test-deleted');
   });
+
+  test('create(branch) creates a named branch in the worktree for PR workflows', () => {
+    const repo = createTestRepo();
+    repos.push(repo);
+    const mgr = new WorktreeManager(repo);
+
+    const branchName = 'feat/test-branch';
+    const worktreePath = mgr.create('test-branch', branchName);
+
+    // Verify the branch exists in the repo
+    const branches = spawnSync('git', ['branch', '--list', branchName], { cwd: repo, stdio: 'pipe' })
+      .stdout.toString()
+      .trim();
+    expect(branches).toContain(branchName);
+
+    // Verify the worktree is on the branch, not detached
+    const headRef = spawnSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: worktreePath, stdio: 'pipe' })
+      .stdout.toString()
+      .trim();
+    expect(headRef).toBe(branchName);
+
+    // Verify we can commit and the commit is reachable from the branch
+    fs.writeFileSync(path.join(worktreePath, 'branch-file.txt'), 'Branch content\n');
+    spawnSync('git', ['add', 'branch-file.txt'], { cwd: worktreePath, stdio: 'pipe' });
+    spawnSync('git', ['commit', '-m', 'Commit on branch'], { cwd: worktreePath, stdio: 'pipe' });
+
+    const branchLog = spawnSync('git', ['log', branchName, '--oneline', '-1'], { cwd: repo, stdio: 'pipe' })
+      .stdout.toString()
+      .trim();
+    expect(branchLog).toContain('Commit on branch');
+
+    mgr.cleanup('test-branch');
+  });
 });

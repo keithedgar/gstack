@@ -111,8 +111,14 @@ export class WorktreeManager {
     });
   }
 
-  /** Create an isolated worktree. Returns the worktree path. Throws on failure. */
-  create(testName: string): string {
+  /** Create an isolated worktree. Returns the worktree path. Throws on failure.
+   *
+   * If *branch* is provided, a new branch is created at HEAD and checked out in
+   * the worktree so the agent can commit and open PRs directly. If omitted,
+   * the worktree is detached (safe for tests that must not interfere with
+   * branch-based workflows).
+   */
+  create(testName: string, branch?: string): string {
     const originalSha = git(['rev-parse', 'HEAD'], this.repoRoot);
 
     const worktreeBase = path.join(this.repoRoot, '.gstack-worktrees', this.runId);
@@ -120,8 +126,14 @@ export class WorktreeManager {
 
     const worktreePath = path.join(worktreeBase, testName);
 
-    // Create detached worktree at current HEAD
-    git(['worktree', 'add', '--detach', worktreePath, 'HEAD'], this.repoRoot);
+    if (branch) {
+      // Named branch — create the branch first, then add a worktree on it
+      git(['branch', branch, 'HEAD'], this.repoRoot);
+      git(['worktree', 'add', worktreePath, branch], this.repoRoot);
+    } else {
+      // Detached worktree at current HEAD (default, non-destructive)
+      git(['worktree', 'add', '--detach', worktreePath, 'HEAD'], this.repoRoot);
+    }
 
     // Copy gitignored build artifacts that tests need (config-driven)
     const { getExternalHosts } = require('../hosts/index');
