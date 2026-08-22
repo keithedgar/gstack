@@ -45,7 +45,12 @@ permissions:
 
 jobs:
   free-tests:
-    runs-on: ubicloud-standard-8
+    # Runner is a repo variable so a FORK can run this lane. Upstream's
+    # ubicloud-standard-8 is the default; a fork with no Ubicloud sets
+    # GSTACK_LINUX_RUNNER=ubuntu-latest and gets the same suite on
+    # GitHub-hosted runners. Without this, every workflow in the repo needs
+    # paid runners and a fork gets no CI at all.
+    runs-on: ${{ vars.GSTACK_LINUX_RUNNER || 'ubicloud-standard-8' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
