@@ -9,9 +9,10 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { startTestServer } from './test-server';
 import { BrowserManager } from '../src/browser-manager';
 import { resolveServerScript } from '../src/cli';
-import { handleReadCommand as _handleReadCommand } from '../src/read-commands';
+import { handleReadCommand as _handleReadCommand, parseOutArgs, hasOutArg, resultToString } from '../src/read-commands';
 import { handleWriteCommand as _handleWriteCommand } from '../src/write-commands';
 import { handleMetaCommand } from '../src/meta-commands';
+import { WRITE_COMMANDS, READ_COMMANDS, META_COMMANDS, PAGE_CONTENT_COMMANDS, wrapUntrustedContent } from '../src/commands';
 import { consoleBuffer, networkBuffer, dialogBuffer, addConsoleEntry, addNetworkEntry, addDialogEntry, CircularBuffer } from '../src/buffers';
 import * as fs from 'fs';
 import { spawn } from 'child_process';
@@ -19,9 +20,99 @@ import * as path from 'path';
 
 // Thin wrappers that bridge old test calls (bm as 3rd arg) to new signatures (session + bm)
 const handleReadCommand = (cmd: string, args: string[], b: BrowserManager) =>
-  _handleReadCommand(cmd, args, b.getActiveSession());
+  _handleReadCommand(cmd, args, b.getActiveSession(), b);
 const handleWriteCommand = (cmd: string, args: string[], b: BrowserManager) =>
   _handleWriteCommand(cmd, args, b.getActiveSession(), b);
+
+// Chain routes every subcommand through the server's executeCommand pipeline in
+// production (the direct-dispatch fallback was deleted — it skipped the security
+// gates). Tests mirror the pipeline minimally: real handlers + trust-wrapping,
+// server-shaped {status, result} envelope.
+function makeChainExecute(b: BrowserManager) {
+  return async (body: { command: string; args?: string[] }) => {
+    const name = body.command;
+    const args = body.args ?? [];
+    try {
+      let result: string;
+      if (WRITE_COMMANDS.has(name)) {
+        result = await _handleWriteCommand(name, args, b.getActiveSession(), b);
+      } else if (READ_COMMANDS.has(name)) {
+        result = await _handleReadCommand(name, args, b.getActiveSession(), b);
+        if (PAGE_CONTENT_COMMANDS.has(name)) {
+          result = wrapUntrustedContent(result, b.getCurrentUrl());
+        }
+      } else if (META_COMMANDS.has(name)) {
+        result = await handleMetaCommand(name, args, b, async () => {});
+      } else {
+        return { status: 404, result: JSON.stringify({ error: `Unknown command: ${name}` }) };
+      }
+      return { status: 200, result };
+    } catch (err: any) {
+      return { status: 500, result: JSON.stringify({ error: err.message }) };
+    }
+  };
+}
+const chainMeta = (b: BrowserManager, args: string[]) =>
+  handleMetaCommand('chain', args, b, async () => {}, null, { executeCommand: makeChainExecute(b) });
+
+// ─── Pure arg-parser + result-conversion unit tests (no browser) ───
+describe('parseOutArgs / hasOutArg', () => {
+  test('--out <path> splits the flag from the positional', () => {
+    expect(parseOutArgs(['expr', '--out', '/tmp/x'])).toEqual({ outPath: '/tmp/x', raw: false, rest: ['expr'] });
+  });
+
+  test('--out=<path> form is equivalent', () => {
+    expect(parseOutArgs(['expr', '--out=/tmp/x'])).toEqual({ outPath: '/tmp/x', raw: false, rest: ['expr'] });
+  });
+
+  test('flag ordering does not matter', () => {
+    expect(parseOutArgs(['--out', '/tmp/x', 'expr'])).toEqual({ outPath: '/tmp/x', raw: false, rest: ['expr'] });
+  });
+
+  test('--raw and --raw=true|false', () => {
+    expect(parseOutArgs(['e', '--out', '/tmp/x', '--raw']).raw).toBe(true);
+    expect(parseOutArgs(['e', '--out', '/tmp/x', '--raw=true']).raw).toBe(true);
+    expect(parseOutArgs(['e', '--out', '/tmp/x', '--raw=false']).raw).toBe(false);
+  });
+
+  test('repeated --out throws', () => {
+    expect(() => parseOutArgs(['e', '--out', '/a', '--out', '/b'])).toThrow(/more than once/);
+  });
+
+  test('--out with a missing value throws', () => {
+    expect(() => parseOutArgs(['e', '--out'])).toThrow(/requires a file path/);
+    expect(() => parseOutArgs(['e', '--out', '--raw'])).toThrow(/requires a file path/);
+    expect(() => parseOutArgs(['e', '--out='])).toThrow(/requires a file path/);
+  });
+
+  test('bad --raw value throws', () => {
+    expect(() => parseOutArgs(['e', '--out', '/a', '--raw=maybe'])).toThrow(/--raw must be true or false/);
+  });
+
+  test('hasOutArg matches --out and --out= exactly, not lookalikes', () => {
+    expect(hasOutArg(['a', '--out', 'b'])).toBe(true);
+    expect(hasOutArg(['a', '--out=b'])).toBe(true);
+    expect(hasOutArg(['a'])).toBe(false);
+    expect(hasOutArg(['a', '--output', 'b'])).toBe(false);
+    expect(hasOutArg(['a', '--outx'])).toBe(false);
+  });
+});
+
+describe('resultToString — byte-for-byte with pre-refactor behavior', () => {
+  test('null becomes "null" (typeof null === object → JSON.stringify)', () => {
+    expect(resultToString(null)).toBe('null');
+  });
+  test('undefined becomes empty string', () => {
+    expect(resultToString(undefined)).toBe('');
+  });
+  test('objects are pretty-printed JSON', () => {
+    expect(resultToString({ a: 1 })).toBe(JSON.stringify({ a: 1 }, null, 2));
+  });
+  test('primitives use String()', () => {
+    expect(resultToString(42)).toBe('42');
+    expect(resultToString(true)).toBe('true');
+  });
+});
 
 let testServer: ReturnType<typeof startTestServer>;
 let bm: BrowserManager;
@@ -35,11 +126,14 @@ beforeAll(async () => {
   await bm.launch();
 });
 
-afterAll(() => {
-  // Force kill browser instead of graceful close (avoids hang)
-  try { testServer.server.stop(); } catch {}
-  // bm.close() can hang — just let process exit handle it
-  setTimeout(() => process.exit(0), 500);
+afterAll(async () => {
+  try { testServer.server.stop(true); } catch {}  // force-close keep-alives — a lingering Chromium connection otherwise blocks stop() forever
+  // Close only this file's own browser — never process.exit(): bun test runs
+  // all files in one process, so a delayed exit kills the whole suite
+  // (see test/no-suicide-exit.test.ts). close() can hang when the browser
+  // already died, and its internal 5s timeout ties bun's 5s hook timeout —
+  // so race it at 3s and abandon; the child is reaped at process exit.
+  try { await Promise.race([bm?.close(), new Promise((resolve) => setTimeout(resolve, 3000))]); } catch {}
 });
 
 // ─── Navigation ─────────────────────────────────────────────────
@@ -223,6 +317,102 @@ describe('Inspection', () => {
   test('js still works for simple expressions', async () => {
     const result = await handleReadCommand('js', ['1 + 2'], bm);
     expect(result).toBe('3');
+  });
+
+  // ─── js/eval --out (render-to-file) ───────────────────────────
+
+  test('js (no --out) returns a multi-MB string without truncation', async () => {
+    // Handler-level guarantee: the result is not sliced/capped before return.
+    // (Full HTTP egress path is exercised elsewhere; this pins the handler.)
+    const result = await handleReadCommand('js', ["'x'.repeat(3 * 1024 * 1024)"], bm);
+    expect(result.length).toBe(3 * 1024 * 1024);
+  });
+
+  test('js --out writes the result to disk and returns a short status, not the payload', async () => {
+    const out = `/tmp/browse-out-large-${Date.now()}.txt`;
+    try {
+      const result = await handleReadCommand('js', ["'y'.repeat(2 * 1024 * 1024)", '--out', out], bm);
+      expect(result).toContain('JS result written:');
+      expect(result).toContain(out);
+      expect(result).toContain(`(${2 * 1024 * 1024} bytes)`);
+      expect(result.length).toBeLessThan(200); // status, not the 2MB payload
+      expect(fs.statSync(out).size).toBe(2 * 1024 * 1024);
+    } finally {
+      fs.rmSync(out, { force: true });
+    }
+  });
+
+  test('js --out decodes a base64 PNG data URL to real bytes', async () => {
+    // 1x1 transparent PNG.
+    const b64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+    const out = `/tmp/browse-out-png-${Date.now()}.png`;
+    try {
+      const result = await handleReadCommand('js', [`'data:image/png;base64,' + '${b64}'`, '--out', out], bm);
+      const buf = fs.readFileSync(out);
+      // PNG magic bytes: 89 50 4E 47
+      expect([buf[0], buf[1], buf[2], buf[3]]).toEqual([0x89, 0x50, 0x4e, 0x47]);
+      const expectedLen = Buffer.from(b64, 'base64').length;
+      expect(buf.length).toBe(expectedLen);
+      expect(result).toContain(`(${expectedLen} bytes)`);
+    } finally {
+      fs.rmSync(out, { force: true });
+    }
+  });
+
+  test('js --out --raw writes the literal data-URL string (no decode)', async () => {
+    const dataUrl = 'data:text/plain;base64,aGVsbG8=';
+    const out = `/tmp/browse-out-raw-${Date.now()}.txt`;
+    try {
+      await handleReadCommand('js', [`'${dataUrl}'`, '--out', out, '--raw'], bm);
+      expect(fs.readFileSync(out, 'utf-8')).toBe(dataUrl);
+    } finally {
+      fs.rmSync(out, { force: true });
+    }
+  });
+
+  test('js --out throws on a malformed base64 data URL instead of writing corrupt bytes', async () => {
+    const out = `/tmp/browse-out-bad-${Date.now()}.png`;
+    try {
+      await expect(
+        handleReadCommand('js', ["'data:image/png;base64,!!!not-base64!!!'", '--out', out], bm)
+      ).rejects.toThrow(/malformed base64/);
+      expect(fs.existsSync(out)).toBe(false);
+    } finally {
+      fs.rmSync(out, { force: true });
+    }
+  });
+
+  test('js --out rejects a path outside the safe directories', async () => {
+    await expect(
+      handleReadCommand('js', ['1 + 1', '--out', '/etc/browse-should-not-write.txt'], bm)
+    ).rejects.toThrow();
+  });
+
+  test('js --out creates a missing parent directory', async () => {
+    // validateOutputPath resolves the parent's realpath, so it permits one level
+    // of missing dir under a safe root (/tmp). mkdir then materializes it.
+    const root = `/tmp/browse-out-nested-${Date.now()}`;
+    const out = `${root}/result.txt`;
+    try {
+      await handleReadCommand('js', ["'nested'", '--out', out], bm);
+      expect(fs.readFileSync(out, 'utf-8')).toBe('nested');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('eval --out writes the file result to disk (parity with js)', async () => {
+    const script = `/tmp/browse-eval-out-src-${Date.now()}.js`;
+    const out = `/tmp/browse-eval-out-${Date.now()}.txt`;
+    fs.writeFileSync(script, "'from eval'");
+    try {
+      const result = await handleReadCommand('eval', [script, '--out', out], bm);
+      expect(result).toContain('Eval result written:');
+      expect(fs.readFileSync(out, 'utf-8')).toBe('from eval');
+    } finally {
+      fs.rmSync(script, { force: true });
+      fs.rmSync(out, { force: true });
+    }
   });
 
   test('css returns computed property', async () => {
@@ -649,7 +839,7 @@ describe('Chain', () => {
       ['js', 'document.title'],
       ['css', 'h1', 'color'],
     ]);
-    const result = await handleMetaCommand('chain', [commands], bm, async () => {});
+    const result = await chainMeta(bm, [commands]);
     expect(result).toContain('[goto]');
     expect(result).toContain('Test Page - Basic');
     expect(result).toContain('[css]');
@@ -657,7 +847,7 @@ describe('Chain', () => {
 
   test('chain wraps page-content sub-commands with trust markers', async () => {
     await handleWriteCommand('goto', [baseUrl + '/basic.html'], bm);
-    const result = await handleMetaCommand('chain', ['text'], bm, async () => {});
+    const result = await chainMeta(bm, ['text']);
     expect(result).toContain('BEGIN UNTRUSTED EXTERNAL CONTENT');
     expect(result).toContain('END UNTRUSTED EXTERNAL CONTENT');
   });
@@ -666,7 +856,7 @@ describe('Chain', () => {
     const commands = JSON.stringify([
       ['goto', 'http://localhost:1/unreachable'],
     ]);
-    const result = await handleMetaCommand('chain', [commands], bm, async () => {});
+    const result = await chainMeta(bm, [commands]);
     expect(result).toContain('[goto] ERROR:');
     expect(result).not.toContain('Unknown meta command');
     expect(result).not.toContain('Unknown read command');
@@ -726,7 +916,10 @@ describe('CLI lifecycle', () => {
     cliEnv.BROWSE_STATE_FILE = stateFile;
     const result = await new Promise<{ code: number; stdout: string; stderr: string }>((resolve) => {
       const proc = spawn('bun', ['run', cliPath, 'status'], {
-        timeout: 15000,
+        // Must exceed the CLI's startup budget (resolveStartTimeout, 15s
+        // non-CI POSIX) or a slow cold boot under full-suite load gets the
+        // child killed at the exact moment the CLI would have succeeded.
+        timeout: 18000,
         env: cliEnv,
       });
       let stdout = '';
@@ -1350,14 +1543,14 @@ describe('Errors', () => {
   test('chain with invalid JSON falls back to pipe format', async () => {
     // Non-JSON input is now treated as pipe-delimited format
     // 'not json' → [["not", "json"]] → "not" is unknown command → error in result
-    const result = await handleMetaCommand('chain', ['not json'], bm, async () => {});
+    const result = await chainMeta(bm, ['not json']);
     expect(result).toContain('ERROR');
     expect(result).toContain('Unknown command: not');
   });
 
   test('chain with no arg throws', async () => {
     try {
-      await handleMetaCommand('chain', [], bm, async () => {});
+      await chainMeta(bm, []);
       expect(true).toBe(false);
     } catch (err: any) {
       expect(err.message).toContain('Usage');
@@ -1851,7 +2044,7 @@ describe('Chain with cookie-import', () => {
       const commands = JSON.stringify([
         ['cookie-import', tmpCookies],
       ]);
-      const result = await handleMetaCommand('chain', [commands], bm, async () => {});
+      const result = await chainMeta(bm, [commands]);
       expect(result).toContain('[cookie-import]');
       expect(result).toContain('Loaded 1 cookie');
     } finally {
@@ -1896,24 +2089,14 @@ describe('Network idle', () => {
 
 describe('Chain pipe format', () => {
   test('pipe-delimited commands work', async () => {
-    const result = await handleMetaCommand(
-      'chain',
-      [`goto ${baseUrl}/basic.html | js document.title`],
-      bm,
-      async () => {}
-    );
+    const result = await chainMeta(bm, [`goto ${baseUrl}/basic.html | js document.title`]);
     expect(result).toContain('[goto]');
     expect(result).toContain('[js]');
     expect(result).toContain('Test Page - Basic');
   });
 
   test('pipe format with quoted args', async () => {
-    const result = await handleMetaCommand(
-      'chain',
-      [`goto ${baseUrl}/forms.html | fill #email "pipe@test.com"`],
-      bm,
-      async () => {}
-    );
+    const result = await chainMeta(bm, [`goto ${baseUrl}/forms.html | fill #email "pipe@test.com"`]);
     expect(result).toContain('[fill]');
     expect(result).toContain('Filled');
     // Verify the fill actually worked
@@ -1926,18 +2109,13 @@ describe('Chain pipe format', () => {
       ['goto', baseUrl + '/basic.html'],
       ['js', 'document.title'],
     ]);
-    const result = await handleMetaCommand('chain', [commands], bm, async () => {});
+    const result = await chainMeta(bm, [commands]);
     expect(result).toContain('[goto]');
     expect(result).toContain('Test Page - Basic');
   });
 
   test('pipe format with unknown command includes error', async () => {
-    const result = await handleMetaCommand(
-      'chain',
-      ['bogus command'],
-      bm,
-      async () => {}
-    );
+    const result = await chainMeta(bm, ['bogus command']);
     expect(result).toContain('ERROR');
     expect(result).toContain('Unknown command: bogus');
   });
@@ -2140,6 +2318,19 @@ describe('load-html', () => {
       expect(err.message).toMatch(/does not appear to be HTML/);
     } finally {
       try { fs.unlinkSync(txtPath); } catch {}
+    }
+  });
+
+  test('load-html rejects .svg files', async () => {
+    const svgPath = path.join(tmpDir, `load-html-test-${Date.now()}.svg`);
+    fs.writeFileSync(svgPath, '<svg xmlns="http://www.w3.org/2000/svg"><text>hi</text></svg>');
+    try {
+      await handleWriteCommand('load-html', [svgPath], bm);
+      expect(true).toBe(false);
+    } catch (err: any) {
+      expect(err.message).toMatch(/does not appear to be HTML/);
+    } finally {
+      try { fs.unlinkSync(svgPath); } catch {}
     }
   });
 
@@ -2414,14 +2605,14 @@ describe('Command aliases', () => {
 
   test('setcontent alias routes to load-html via chain', async () => {
     // Chain canonicalizes aliases end-to-end; verifies the dispatch path
-    const result = await handleMetaCommand('chain', [JSON.stringify([['setcontent', aliasFix]])], bm, async () => {});
+    const result = await chainMeta(bm, [JSON.stringify([['setcontent', aliasFix]])]);
     expect(result).toContain('Loaded HTML:');
     const text = await handleReadCommand('text', [], bm);
     expect(text).toContain('alias routing ok');
   });
 
   test('set-content (hyphenated) alias also routes', async () => {
-    const result = await handleMetaCommand('chain', [JSON.stringify([['set-content', aliasFix]])], bm, async () => {});
+    const result = await chainMeta(bm, [JSON.stringify([['set-content', aliasFix]])]);
     expect(result).toContain('Loaded HTML:');
   });
 });

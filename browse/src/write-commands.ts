@@ -11,12 +11,14 @@ import { findInstalledBrowsers, importCookies, importCookiesViaCdp, hasV20Cookie
 import { generatePickerCode } from './cookie-picker-routes';
 import { validateNavigationUrl } from './url-validation';
 import { validateOutputPath, validateReadPath } from './path-security';
+import { guardScreenshotPath } from './screenshot-size-guard';
 import * as fs from 'fs';
 import * as path from 'path';
 import type { SetContentWaitUntil } from './tab-session';
 import { TEMP_DIR, isPathWithin } from './platform';
 import { SAFE_DIRECTORIES } from './path-security';
 import { modifyStyle, undoModification, resetModifications, getModificationHistory } from './cdp-inspector';
+import { withCdpSession } from './cdp-bridge';
 
 /**
  * Aggressive page cleanup selectors and heuristics.
@@ -247,11 +249,11 @@ export async function handleWriteCommand(
       if (!filePath) throw new Error('Usage: browse load-html <file> [--wait-until load|domcontentloaded|networkidle] [--tab-id <N>]  |  load-html --from-file <payload.json> [--tab-id <N>]');
 
       // Extension allowlist
-      const ALLOWED_EXT = ['.html', '.htm', '.xhtml', '.svg'];
+      const ALLOWED_EXT = ['.html', '.htm', '.xhtml'];
       const ext = path.extname(filePath).toLowerCase();
       if (!ALLOWED_EXT.includes(ext)) {
         throw new Error(
-          `load-html: file does not appear to be HTML. Expected .html/.htm/.xhtml/.svg, got ${ext || '(no extension)'}. Rename the file if it's really HTML.`
+          `load-html: file does not appear to be HTML. Expected .html/.htm/.xhtml, got ${ext || '(no extension)'}. Rename the file if it's really HTML.`
         );
       }
 
@@ -375,11 +377,14 @@ export async function handleWriteCommand(
       const value = valueParts.join(' ');
       if (!selector || !value) throw new Error('Usage: browse fill <selector> <value>');
       const resolved = await session.resolveRef(selector);
-      if ('locator' in resolved) {
-        await resolved.locator.fill(value, { timeout: 5000 });
-      } else {
-        await target.locator(resolved.selector).fill(value, { timeout: 5000 });
-      }
+      const locator = 'locator' in resolved ? resolved.locator : target.locator(resolved.selector);
+      await locator.fill(value, { timeout: 5000 });
+      // Playwright's fill() only dispatches an `input` event. Frameworks that
+      // validate on `change` (AngularJS ng-change, debounced strength/match
+      // checks — e.g. cPanel's Jupiter theme) never see the update, so a value
+      // that's correct in the DOM can still fail the framework's own
+      // validation. Dispatch `change` too so those listeners fire.
+      await locator.dispatchEvent('change');
       // Wait for network to settle (form validation XHRs)
       await page.waitForLoadState('networkidle', { timeout: 2000 }).catch(() => {});
       return `Filled ${selector}`;
@@ -749,7 +754,7 @@ export async function handleWriteCommand(
       const code = generatePickerCode();
       const pickerUrl = `http://127.0.0.1:${port}/cookie-picker?code=${code}`;
       try {
-        Bun.spawn(['open', pickerUrl], { stdout: 'ignore', stderr: 'ignore' });
+        Bun.spawn(['open', pickerUrl], { stdout: 'ignore', stderr: 'ignore', windowsHide: true });
       } catch (err: any) {
         // open may fail on non-macOS or if 'open' binary is missing — URL is in the message below
         if (err?.code !== 'ENOENT' && !err?.message?.includes('spawn')) throw err;
@@ -1123,6 +1128,10 @@ export async function handleWriteCommand(
 
       // Take screenshot
       await page.screenshot({ path: outputPath, fullPage: !scrollTo });
+      // Guard against Anthropic vision API >2000px brick (#1214). Only
+      // applies to fullPage captures; scrollTo viewport-bound shots are
+      // already capped by the viewport size.
+      if (!scrollTo) await guardScreenshotPath(outputPath);
 
       // Restore viewport
       if (viewportWidth && originalViewport) {
@@ -1137,9 +1146,10 @@ export async function handleWriteCommand(
     }
 
     case 'download': {
-      if (args.length === 0) throw new Error('Usage: download <url|@ref> [path] [--base64]');
+      if (args.length === 0) throw new Error('Usage: download <url|@ref> [path] [--base64] [--navigate]');
       const isBase64 = args.includes('--base64');
-      const filteredArgs = args.filter(a => a !== '--base64');
+      const useNavigate = args.includes('--navigate');
+      const filteredArgs = args.filter(a => a !== '--base64' && a !== '--navigate');
       let url = filteredArgs[0];
       const outputPath = filteredArgs[1];
 
@@ -1200,6 +1210,60 @@ export async function handleWriteCommand(
         if (!match) throw new Error('Failed to decode blob data');
         contentType = match[1];
         buffer = Buffer.from(match[2], 'base64');
+      } else if (useNavigate) {
+        // Strategy 2: Navigate to URL and capture browser-triggered download.
+        // Handles URLs that trigger file downloads via redirects,
+        // Content-Disposition headers, or anti-bot CDN chains where
+        // page.request.fetch() can't follow the auth/redirect chain.
+        await validateNavigationUrl(url);
+        const downloadPromise = page.waitForEvent('download', { timeout: 60000 });
+        // Use goto with 'commit' wait — the page may redirect to trigger
+        // the download, so 'domcontentloaded' may never fire.
+        page.goto(url, { waitUntil: 'commit', timeout: 30000 }).catch(() => {
+          // Navigation may "fail" because the response is a download,
+          // not a page. The download event handles it.
+        });
+        const download = await downloadPromise;
+        const failure = await download.failure();
+        if (failure) {
+          throw new Error(`Download failed: ${failure}`);
+        }
+        // Save to temp location first, then read into buffer
+        const tempPath = path.join(TEMP_DIR, `browse-nav-download-${Date.now()}`);
+        await download.saveAs(tempPath);
+        buffer = fs.readFileSync(tempPath);
+        // Try to infer content type from suggested filename
+        const suggested = download.suggestedFilename();
+        if (suggested) {
+          const extMatch = suggested.match(/\.([a-z0-9]+)$/i);
+          if (extMatch) {
+            const extLower = extMatch[1].toLowerCase();
+            const mimeMap: Record<string, string> = {
+              epub: 'application/epub+zip', pdf: 'application/pdf',
+              zip: 'application/zip', gz: 'application/gzip',
+              mp3: 'audio/mpeg', mp4: 'video/mp4',
+              jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
+              txt: 'text/plain', html: 'text/html', json: 'application/json',
+            };
+            contentType = mimeMap[extLower] || 'application/octet-stream';
+          }
+        }
+        // Clean up temp file if we're going to write elsewhere
+        if (outputPath || isBase64) {
+          try { fs.unlinkSync(tempPath); } catch { /* ignore */ }
+        } else {
+          // No explicit output path — rename temp file with inferred extension.
+          const ext = contentType.split(';')[0].includes('/')
+            ? mimeToExt(contentType.split(';')[0].trim())
+            : '.bin';
+          const finalPath = path.join(TEMP_DIR, `browse-download-${Date.now()}${ext}`);
+          fs.renameSync(tempPath, finalPath);
+          const sizeKB = Math.round(buffer.length / 1024);
+          return `Downloaded: ${finalPath} (${sizeKB}KB, ${contentType.split(';')[0].trim()})${suggested ? ` [${suggested}]` : ''}`;
+        }
+        if (buffer.length > 200 * 1024 * 1024) {
+          throw new Error('File too large (>200MB).');
+        }
       } else {
         // Strategy 1: Direct URL via page.request.fetch().
         // Gate the URL through the same validator `goto` uses. Without
@@ -1349,9 +1413,10 @@ export async function handleWriteCommand(
       validateOutputPath(outputPath);
 
       try {
-        const cdp = await page.context().newCDPSession(page);
-        const { data } = await cdp.send('Page.captureSnapshot', { format: 'mhtml' });
-        await cdp.detach();
+        const data = await withCdpSession(page, async (cdp) => {
+          const result = await cdp.send('Page.captureSnapshot', { format: 'mhtml' });
+          return (result as { data: string }).data;
+        });
         fs.writeFileSync(outputPath, data);
         return `Archive saved: ${outputPath} (${Math.round(data.length / 1024)}KB, MHTML)`;
       } catch (err: any) {

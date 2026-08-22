@@ -9,8 +9,9 @@ the command output.
 
 ## `BRAIN_SYNC: brain repo detected: <url>`
 
-**Problem.** You're on a machine that has `~/.gstack-brain-remote.txt` (copied
-from another machine) but no local git repo at `~/.gstack/.git`.
+**Problem.** You're on a machine that has `~/.gstack-artifacts-remote.txt`
+(or the legacy `~/.gstack-brain-remote.txt`, copied from another machine) but
+no local git repo at `~/.gstack/.git`.
 
 **Cause.** You've set up GBrain sync elsewhere and your gstack hasn't been
 restored on this machine yet.
@@ -23,7 +24,7 @@ This pulls the repo into `~/.gstack/` and re-registers merge drivers.
 
 If you don't want to restore here, dismiss the hint with:
 ```bash
-gstack-config set gbrain_sync_mode_prompted true
+gstack-config set artifacts_sync_mode_prompted true
 ```
 
 ---
@@ -92,23 +93,48 @@ your local commit still exists — the next skill run will retry the push.
 
 ---
 
-## `gstack-brain-init: ~/.gstack/.git is already a git repo pointing at <url>`
+## `gstack: brain-sync push NOT sent — the egress receipt could not be written`
 
-**Problem.** You tried to init with a remote URL that doesn't match the
-existing one.
+**Problem.** The push was refused before anything left your machine. Every
+brain-sync push writes a tamper-evident receipt to the egress ledger
+(`~/.gstack/security/egress.jsonl`) before sending, fail-closed. The
+receipt could not be written, so nothing was sent, no local commit was
+made, and the queue is preserved — the next run retries the whole drain.
+`gstack-brain-sync --status` shows `EGRESS_RECEIPT_FAILED` as the failure
+detail.
 
-**Cause.** You already ran `gstack-brain-init` with a different remote.
+**Cause.** `~/.gstack/security/` is not writable (the receipt writer creates
+it when missing, so absence alone is not the cause), the disk is full, or
+`GSTACK_HOME` points at a read-only location.
 
-**Fix.** Either:
-
-- Use the existing remote: run `gstack-brain-init` without `--remote`, or
-  with the matching URL.
-- Switch remotes: `gstack-brain-uninstall` first, then re-init with the new
-  URL. This does not delete your data.
+**Fix.**
+```bash
+mkdir -p ~/.gstack/security && chmod -R u+w ~/.gstack/security
+```
+Then run any skill (or `gstack-brain-sync --once`) to retry. Inspect the
+ledger with `gstack-egress list`; verify its hash chain with
+`gstack-egress verify`.
 
 ---
 
-## `Remote not reachable: <url>`
+## `gstack-artifacts-init: ~/.gstack/ is already a git repo pointing at: <url>`
+
+**Problem.** You tried to init with a remote URL that doesn't match the
+existing one. The command refuses to overwrite.
+
+**Cause.** You already ran `gstack-artifacts-init` with a different remote.
+
+**Fix.** Either:
+
+- Use the existing remote: run `gstack-artifacts-init` without `--remote`, or
+  with the matching URL.
+- Switch remotes: `git -C ~/.gstack remote set-url origin <url>` (the
+  command's own suggestion), or `gstack-brain-uninstall` first, then re-init
+  with the new URL. Neither deletes your data.
+
+---
+
+## `Remote not reachable via SSH: <url>`
 
 **Problem.** Init couldn't reach the git remote to verify connectivity.
 
@@ -126,7 +152,7 @@ If that fails, check:
 
 ---
 
-## `gstack-brain-init: failed to create or find '<name>'`
+## `Failed to create or find '<name>'. Try --remote <url>.`
 
 **Problem.** Auto-repo-creation via `gh repo create` failed and the repo
 isn't discoverable via `gh repo view` either.
@@ -141,7 +167,7 @@ gh auth status
 If unauth'd, run `gh auth login`. If the repo name collides, pass a different
 name:
 ```bash
-gstack-brain-init --remote git@github.com:YOURUSER/custom-name.git
+gstack-artifacts-init --remote git@github.com:YOURUSER/custom-name.git
 ```
 
 ---
@@ -168,7 +194,7 @@ gstack session, or (b) a previous failed restore left partial state.
 **Fix (three options).**
 
 1. **If this machine's state should become the new truth**: run
-   `gstack-brain-init` instead of restore — this creates a brand-new brain
+   `gstack-artifacts-init` instead of restore — this creates a brand-new brain
    repo from this machine's state.
 
 2. **If you want to adopt the remote and discard this machine's state**:
@@ -189,7 +215,7 @@ and `.gitattributes`.
 **Cause.** You pointed restore at a random git repo, or someone deleted the
 canonical config files from the brain repo.
 
-**Fix.** Verify the URL. If it's correct, run `gstack-brain-init --remote
+**Fix.** Verify the URL. If it's correct, run `gstack-artifacts-init --remote
 <url>` to re-seed the canonical config.
 
 ---
@@ -200,7 +226,7 @@ canonical config files from the brain repo.
 
 1. `gstack-brain-sync --status` — is mode `off`?
 2. `~/.gstack/.git` exists?
-3. `gstack-config get gbrain_sync_mode` — should be `full` or `artifacts-only`.
+3. `gstack-config get artifacts_sync_mode` — should be `full` or `artifacts-only`.
 4. The file you expect to sync — is it in the allowlist?
    `cat ~/.gstack/.brain-allowlist`
 5. Privacy class filter — if mode is `artifacts-only`, behavioral files

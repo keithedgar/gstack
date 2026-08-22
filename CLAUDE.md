@@ -4,11 +4,13 @@
 
 ```bash
 bun install          # install dependencies
-bun test             # run free tests (browse + snapshot + skill validation)
+bun run test         # run free tests via the strict parallel runner (~90-100s full suite)
 bun run test:evals   # run paid evals: LLM judge + E2E (diff-based, ~$4/run max)
 bun run test:evals:all  # run ALL paid evals regardless of diff
 bun run test:gate    # run gate-tier tests only (CI default, blocks merge)
 bun run test:periodic  # run periodic-tier tests only (weekly cron / manual)
+bun run test:gate:sharded    # gate tier via the sharded paid runner (one Bun process per test file)
+bun run test:periodic:sharded  # periodic tier via the sharded paid runner (implies EVALS_ALL=1)
 bun run test:e2e     # run E2E tests only (diff-based, ~$3.85/run max)
 bun run test:e2e:all # run ALL E2E tests regardless of diff
 bun run eval:select  # show which tests would run based on current diff
@@ -17,38 +19,55 @@ bun run build        # gen docs + compile binaries
 bun run gen:skill-docs  # regenerate SKILL.md files from templates
 bun run skill:check  # health dashboard for all skills
 bun run dev:skill    # watch mode: auto-regen + validate on change
-bun run eval:list    # list all eval runs from ~/.gstack-dev/evals/
+bun run eval:list    # list all eval runs from ~/.gstack/projects/<slug>/evals/
 bun run eval:compare # compare two eval runs (auto-picks most recent)
 bun run eval:summary # aggregate stats across all eval runs
 bun run slop          # full slop-scan report (all files)
 bun run slop:diff     # slop findings in files changed on this branch only
 ```
 
-`test:evals` requires `ANTHROPIC_API_KEY`. Codex E2E tests (`test/codex-e2e.test.ts`)
-use Codex's own auth from `~/.codex/` config — no `OPENAI_API_KEY` env var needed.
+`test:evals` requires `ANTHROPIC_API_KEY`. Codex E2E tests (`test/codex-e2e.test.ts`,
+`test/codex-e2e-sol-scope.test.ts`) use Codex's own auth — the hermetic runner copies
+only `auth.json` from `${CODEX_HOME:-~/.codex}` and pins `CODEX_HOME` in the child
+env — no `OPENAI_API_KEY` env var needed.
 
-**Where the keys live on this machine.** Conductor workspaces don't inherit the
-user's interactive shell env, so `ANTHROPIC_API_KEY` and `OPENAI_API_KEY` aren't
-in the default process env. Before running any paid eval / E2E, source them from
-`~/.zshrc` (that's where Garry keeps them):
+**Env keys in Conductor workspaces.** The `GSTACK_*` env-shim (v1.39.2.0+,
+`lib/conductor-env-shim.ts`) promotes `GSTACK_ANTHROPIC_API_KEY` /
+`GSTACK_OPENAI_API_KEY` to their canonical names inside gstack's TS binaries.
+Tests run through gstack entrypoints inherit this promotion automatically.
+Don't echo the key value to stdout, logs, or shell history. The historical
+"never pass `env:` to `runAgentSdkTest`" rule is retired: the failure was
+partial-env replacement (the SDK's `Options.env` REPLACES the child's entire
+environment, so an object without the key broke auth). The runner now always
+passes a COMPLETE hermetic env with per-test `env:` merged last, so per-test
+overrides are safe; ambient `process.env.ANTHROPIC_API_KEY` mutation also
+still works (the env builder reads process.env at call time).
 
-```bash
-bash -c '
-  eval "$(grep -E "^export (ANTHROPIC_API_KEY|OPENAI_API_KEY)=" ~/.zshrc)"
-  export ANTHROPIC_API_KEY OPENAI_API_KEY
-  EVALS=1 EVALS_TIER=periodic bun test test/skill-e2e-<whatever>.test.ts
-'
-```
+**Hermetic local E2E (default).** Every E2E runner (claude -p, PTY, Agent
+SDK, codex, gemini) spawns children through `test/helpers/hermetic-env.ts`:
+allowlist-scrubbed env (operator `CONDUCTOR_*`, `CLAUDE_*`, `GSTACK_*`,
+`MCP_*`, `GBRAIN_*`, and credentials like `GH_TOKEN` never reach children),
+a fresh seeded `CLAUDE_CONFIG_DIR` (no operator `~/.claude` CLAUDE.md /
+MCP servers / skills), a temp `GSTACK_HOME`, and `--strict-mcp-config`.
+Local eval signal matches CI. Debug against real operator state with
+`EVALS_HERMETIC=0` (restores the legacy env AND drops the strict-MCP flag).
+Per-test `env:` overrides merge last, so deliberate contamination
+(`CONDUCTOR_WORKSPACE_PATH`, per-test `GSTACK_HOME`) keeps working. The
+hermetic config dir seeds NO skills by default; a PTY test that types a
+`/skill` slash command must pass `seedSkills: true` to the PTY runner, which
+points the child's `CLAUDE_CONFIG_DIR` at `hermeticSkillsConfigDir()` — a
+seeded registry that symlinks the LIVE working tree's SKILL.md files (by
+design: the skills ARE the subject under test; a snapshot would measure stale
+copies). Wiring is pinned by `test/hermetic-wiring.test.ts` (static tripwire),
+two gate-tier canaries in `test/skill-e2e-hermetic-canary.test.ts`, and the
+seeding tripwires in `test/hermetic-skills-seeding.test.ts` /
+`test/pty-skill-seeding-wiring.test.ts`.
 
-Do not echo the key value anywhere (stdout, logs, shell history). The grep+eval
-pattern keeps it in process env only. When passing to a test's Agent SDK, do NOT
-pass `env: {...}` to `runAgentSdkTest` — the SDK's auth pipeline doesn't pick up
-the key the same way when env is supplied as an object (confirmed failure mode).
-Instead, mutate `process.env.ANTHROPIC_API_KEY` ambiently before the call and
-restore in `finally`.
 E2E tests stream progress in real-time (tool-by-tool via `--output-format stream-json
---verbose`). Results are persisted to `~/.gstack-dev/evals/` with auto-comparison
-against the previous run.
+--verbose`). Results are persisted to `~/.gstack/projects/<slug>/evals/` (legacy
+fallback `~/.gstack-dev/evals/`) with auto-comparison
+against the previous finalized run (in-flight `_partial` files are never used as
+a baseline, so a run can't compare against itself).
 
 **Diff-based test selection:** `test:evals` and `test:e2e` auto-select tests based
 on `git diff` against the base branch. Each test declares its file dependencies in
@@ -57,21 +76,36 @@ touchfiles.ts itself) trigger all tests. Use `EVALS_ALL=1` or the `:all` script
 variants to force all tests. Run `eval:select` to preview which tests would run.
 
 **Two-tier system:** Tests are classified as `gate` or `periodic` in `E2E_TIERS`
-(in `test/helpers/touchfiles.ts`). CI runs only gate tests (`EVALS_TIER=gate`);
+(in `test/helpers/touchfiles.ts` — a facade over `touchfiles-data.ts` +
+`test-selection.ts`). CI runs only gate tests (`EVALS_TIER=gate`); the free
+suite runs on every PR via `.github/workflows/free-tests.yml` (a REQUIRED
+check, secretless — fork PRs get real signal);
 periodic tests run weekly via cron or manually. Use `EVALS_TIER=gate` or
 `EVALS_TIER=periodic` to filter. When adding new E2E tests, classify them:
 1. Safety guardrail or deterministic functional test? -> `gate`
 2. Quality benchmark, Opus model test, or non-deterministic? -> `periodic`
 3. Requires external service (Codex, Gemini)? -> `periodic`
 
+Tier declarations are enforced by `test/e2e-tier-alignment.test.ts` (free, runs
+in `bun test`): a `skill-e2e-*` file named in a touchfiles dep list whose
+`EVALS_TIER` self-gate disagrees with its declared tier in `E2E_TIERS` fails the
+suite. Files not named in any dep list are reported, not enforced — keep both
+in sync.
+
 ## Testing
 
 ```bash
-bun test             # run before every commit — free, <2s
+bun run test         # run before every commit — free, ~90-100s for the full ~7,000-test suite
 bun run test:evals   # run before shipping — paid, diff-based (~$4/run max)
 ```
 
-`bun test` runs skill validation, gen-skill-docs quality checks, and browse
+`bun run test` routes through `scripts/test-free-shards.ts` (N concurrent
+shard processes, serial within each, plus a trailing serial tree-mutating
+shard — with strict-output classification per shard: a shard without bun's
+terminal summary line FAILS — silent truncation
+cannot report green). Never type bare `bun test` for the suite: it walks the
+whole repo, loading paid eval files and missing the strict classifier.
+It covers skill validation, gen-skill-docs quality checks, and browse
 integration tests. `bun run test:evals` runs LLM-judge quality evals and E2E
 tests via `claude -p`. Both must pass before creating a PR.
 
@@ -95,9 +129,9 @@ gstack/
 │   ├── gen-skill-docs.ts  # Template → SKILL.md generator (config-driven)
 │   ├── host-config.ts     # HostConfig interface + validator
 │   ├── host-config-export.ts  # Shell bridge for setup script
-│   ├── host-adapters/     # Host-specific adapters (OpenClaw tool mapping)
 │   ├── resolvers/   # Template resolver modules (preamble, design, review, gbrain, etc.)
 │   ├── skill-check.ts     # Health dashboard
+│   ├── test-paid-shards.ts  # Sharded paid-tier runner (one Bun process per shard)
 │   └── dev-skill.ts       # Watch mode
 ├── test/            # Skill validation + eval tests
 │   ├── helpers/     # skill-parser.ts, session-runner.ts, llm-judge.ts, eval-store.ts
@@ -120,9 +154,11 @@ gstack/
 ├── land-and-deploy/ # /land-and-deploy skill (merge → deploy → canary verify)
 ├── office-hours/    # /office-hours skill (YC Office Hours — startup diagnostic + builder brainstorm)
 ├── investigate/     # /investigate skill (systematic root-cause debugging)
+├── spec/            # /spec skill (five-phase spec → GitHub issue, optional agent spawn, /ship auto-closes)
 ├── retro/           # Retrospective skill (includes /retro global cross-project mode)
-├── bin/             # CLI utilities (gstack-repo-mode, gstack-slug, gstack-config, etc.)
-├── document-release/ # /document-release skill (post-ship doc updates)
+├── bin/             # CLI utilities (gstack-repo-mode, gstack-slug, gstack-config, gstack-wtree, gstack-evidence, gstack-issue-guard, etc.)
+├── document-release/ # /document-release skill (post-ship doc updates + Diataxis coverage map)
+├── document-generate/ # /document-generate skill (Diataxis doc generator: tutorial/how-to/reference/explanation)
 ├── cso/             # /cso skill (OWASP Top 10 + STRIDE security audit)
 ├── design-consultation/ # /design-consultation skill (design system from scratch)
 ├── design-shotgun/  # /design-shotgun skill (visual design exploration)
@@ -133,18 +169,19 @@ gstack/
 │   ├── test/        # Integration tests
 │   └── dist/        # Compiled binary
 ├── extension/       # Chrome extension (side panel + activity feed + CSS inspector)
-├── lib/             # Shared libraries (worktree.ts)
+├── lib/             # Shared libraries (worktree.ts, egress-receipt.ts, context-bill.ts, redact-engine.ts, tracker-guard.ts, version-source.ts, code-intelligence/)
+├── patches/         # bun `patchedDependencies` patches (playwright-core windowsHide)
 ├── docs/designs/    # Design documents
 ├── setup-deploy/    # /setup-deploy skill (one-time deploy config)
 ├── .github/         # CI workflows + Docker image
-│   ├── workflows/   # evals.yml (E2E on Ubicloud), skill-docs.yml, actionlint.yml
+│   ├── workflows/   # evals.yml (E2E on Ubicloud), quality-gate.yml (secret scan), dependency-review.yml, osv-scanner.yml, skill-docs.yml, actionlint.yml, and 8 more (windows, periodic evals, release gates, ci-image)
 │   └── docker/      # Dockerfile.ci (pre-baked toolchain + Playwright/Chromium)
 ├── contrib/         # Contributor-only tools (never installed for users)
 │   └── add-host/    # /gstack-contrib-add-host skill
 ├── setup            # One-time setup: build binary + symlink skills
 ├── SKILL.md         # Generated from SKILL.md.tmpl (don't edit directly)
 ├── SKILL.md.tmpl    # Template: edit this, run gen:skill-docs
-├── ETHOS.md         # Builder philosophy (Boil the Lake, Search Before Building)
+├── ETHOS.md         # Builder philosophy (Boil the Ocean, Search Before Building)
 └── package.json     # Build scripts for browse
 ```
 
@@ -155,6 +192,15 @@ SKILL.md files are **generated** from `.tmpl` templates. To update docs:
 1. Edit the `.tmpl` file (e.g. `SKILL.md.tmpl` or `browse/SKILL.md.tmpl`)
 2. Run `bun run gen:skill-docs` (or `bun run build` which does it automatically)
 3. Commit both the `.tmpl` and generated `.md` files
+
+Generation uses each host's `defaultModel` (`claude` for existing hosts, `gpt`
+for Codex) unless `--model` is explicit. Codex installs additionally read the
+top-level model from `${CODEX_HOME:-~/.codex}/config.toml`; rerun
+`./setup --host codex` after changing that model. Note: `bun run build` and a
+bare `gen:skill-docs --host codex` render the host default (gpt) — if your
+Codex config.toml pins a different model, rerun `./setup --host codex`
+afterwards to restore your profile (single-owner persistence is filed in
+TODOS.md).
 
 To add a new browse command: add it to `browse/src/commands.ts` and rebuild.
 To add a snapshot flag: add it to `SNAPSHOT_FLAGS` in `browse/src/snapshot.ts` and rebuild.
@@ -169,6 +215,16 @@ behavior). If you blow past 40K, the right fix is usually: (1) look at WHAT grew
 (2) if one resolver added 10K+ in a single PR, question whether it belongs inline
 or as a reference doc, (3) only compress carefully-tuned prose as a last resort —
 cuts to the coverage audit, review army, or voice directive have real quality cost.
+
+A second, harder ceiling guards the DISCOVERY surface: `test/catalog-budget.test.ts`
+caps the aggregate frontmatter `name` + `description` across all skills at 1,150
+token-equivalents (260-byte per-skill sub-cap), counted through the shared census
+in `test/helpers/skill-census.ts`. This one is enforced, not a warning — every
+host loads the full catalog every session, so growth here taxes every
+conversation. The failure message carries the re-measure + ratchet protocol.
+`bin/gstack-context-bill` shows the full token bill-of-materials for a skills
+tree (always-on vs per-invocation, `--diff`, `--budget`; `--exact` opts into the
+real tokenizer and POSTs file text to api.anthropic.com with an egress receipt).
 
 **Merge conflicts on SKILL.md files:** NEVER resolve conflicts on generated SKILL.md
 files by accepting either side. Instead: (1) resolve conflicts on the `.tmpl` templates
@@ -235,6 +291,24 @@ Activity / Refs / Inspector as debug overlays behind the footer's
 flow, dual-token model, and threat-model boundary — silent failures
 here usually trace to not understanding the cross-component flow.
 
+**Embedder terminal-agent ownership** (v1.42.1.0+, identity-based kill v1.44.0.0+).
+`buildFetchHandler` in `browse/src/server.ts` accepts `ServerConfig.ownsTerminalAgent?:
+boolean` (default `true`). When `true`, factory shutdown runs the full teardown:
+identity-based kill via `killAgentByRecord(readAgentRecord(stateDir))` from
+`browse/src/terminal-agent-control.ts` plus `safeUnlinkQuiet` on
+`<stateDir>/terminal-port`, `<stateDir>/terminal-internal-token`, and
+`<stateDir>/terminal-agent-pid` (the per-boot agent record introduced in v1.44).
+Embedders (e.g. the gbrowser phoenix overlay) that pre-launch their own PTY
+server must pass `false` so their discovery files survive gstack teardown cycles.
+The flag is the third caller-owned teardown gate in `ServerConfig` (alongside
+`xvfb?` and `proxyBridge?`); polarity is inverted (explicit bool vs presence) and
+documented in the field's JSDoc. CLI `start()` always passes `true` explicitly —
+the static-grep test in `browse/test/server-embedder-terminal-port.test.ts` fails
+CI if a refactor drops it. Pre-v1.44 used `pkill -f terminal-agent\.ts` (regex
+match) which would kill sibling gstack sessions on the same host; the new
+`browse/test/terminal-agent-pid-identity.test.ts` static-grep tripwire fails CI
+if any source file re-introduces `pkill ... terminal-agent` or `spawnSync('pkill', ...)`.
+
 **WebSocket auth uses Sec-WebSocket-Protocol, not cookies.** Browsers
 can't set `Authorization` on a WebSocket upgrade, but they CAN set
 `Sec-WebSocket-Protocol` via `new WebSocket(url, [token])`. The agent
@@ -250,10 +324,14 @@ PTY via `window.gstackInjectToTerminal(text)`, exposed by
 `sidepanel-terminal.js`. No `/sidebar-command` POST — the live REPL is
 the only execution surface in the sidebar now.
 
-**`/health` MUST NOT surface any shell-grant token.** It already leaks
-`AUTH_TOKEN` to localhost callers in headed mode (a v1.1+ TODO). Don't
-make that worse by adding the PTY session token there. PTY auth flows
-through `POST /pty-session` only.
+**`/health` MUST NOT surface any token — and it no longer does** (v1.63+).
+The historical headed-mode leak of `AUTH_TOKEN` is fixed: `GET /health` is
+liveness/status only in every mode. Token bootstrap is `POST /extension-token`,
+which validates the caller's Origin against the pinned extension identity
+(the `key` field in `extension/manifest.json` pins the extension ID —
+`GSTACK_EXTENSION_ID` in `browse/src/server.ts`, derivation reproducible via
+`bun browse/scripts/extension-id.ts`) plus a loopback Host. PTY auth still
+flows through `POST /pty-session` only. Don't add any token to `/health`.
 
 **Transport-layer security** (v1.6.0.0+). When `pair-agent` starts an ngrok tunnel,
 the daemon binds two HTTP listeners: a local listener (127.0.0.1, full command
@@ -268,47 +346,112 @@ to `~/.gstack/security/attempts.jsonl` via `tunnel-denial-log.ts`. Before editin
 the module boundary (no imports from `token-registry.ts` into `sse-session-cookie.ts`)
 is load-bearing for scope isolation.
 
+**Unicode sanitization at server egress** (v1.38.0.0+). Every server egress that
+ships page-content-derived strings MUST go through `JSON.stringify(payload,
+sanitizeReplacer)` for object payloads or `sanitizeLoneSurrogates(body)` for text
+bodies. Lone UTF-16 surrogate halves from CDP page content otherwise reach the
+Anthropic API as `\uD800`-style escapes and trigger a 400. Wired at four egress
+points today: `handleCommandInternal` (HTTP + batch via a sanitizing wrapper around
+`handleCommandInternalImpl`) and both SSE producers (`/activity/stream`,
+`/inspector/events`). Post-stringify regex is a no-op — `JSON.stringify` has
+already escaped the surrogate before regex could match, so the replacer must run
+inside the encoding pipeline. Before adding a new SSE/WebSocket writer or HTTP
+response in `server.ts`, read
+[ARCHITECTURE.md](ARCHITECTURE.md#unicode-sanitization-at-server-egress-v13800).
+`browse/test/server-sanitize-surrogates.test.ts` pins the wiring with invariant
+tests, so bypasses fail CI.
+
+**Egress receipts at every off-machine sink** (v1.63.0.0+). Every gstack-initiated
+send off the machine MUST write a hash-chained receipt to
+`~/.gstack/security/egress.jsonl` BEFORE the send: TypeScript callers use
+`writeReceipt` from `lib/egress-receipt.ts`; shell scripts source
+`bin/gstack-egress-lib.sh` and use `_receipted_curl` / `_receipted_git`. Failure
+polarity is per-class: fail-closed for sensitive sinks (brain-sync, memory-ingest,
+gbrain-sync, telemetry, ngrok tunnels, mcp-verify, supabase-provision), fail-open
++ stderr warning for user-facing ones (design OpenAI calls, update-check,
+dashboards, git-class ops). The new-sink scanner in
+`test/egress-receipt-wiring.test.ts` fails CI on an unreceipted `curl` /
+`git push` / `fetch` to a non-loopback host unless the file carries a reasoned
+entry in its `SCANNER_EXEMPT` list (user-directed page fetches, reachability
+probes, instruction strings, skill prose) — if you add a new off-machine sink,
+wire it through the helpers and add it to the enumerated sink list. Inspect with
+`bin/gstack-egress` (`list` | `verify`, exit 3 on tamper | `grants`). Threat
+model: forensic observability of ATTEMPTED egress, not an exfiltration control.
+
+**SSE endpoint helper** (v1.51.0.0+). New SSE endpoints in `server.ts` MUST route
+through `createSseEndpoint(req, config)` from `browse/src/sse-helpers.ts`. The
+helper owns the cleanup contract (abort + enqueue-throw + heartbeat-throw, all
+idempotent) and bakes in `sanitizeLoneSurrogates` on every JSON.stringify, so
+new subscribers can't accidentally regress either invariant. Inline
+`ReadableStream` wiring leaked subscribers when the TCP connection died without
+firing `req.signal.abort` (Chromium MV3 service-worker suspend, intermediate
+proxy half-close). `/activity/stream`, `/inspector/events`, and `/memory`
+(SSE-eligible) all route through it. `browse/test/sse-helpers.test.ts` pins the
+cleanup contract.
+
+**CDP session lifecycle** (v1.51.0.0+). Direct `page.context().newCDPSession(page)`
+calls outside `browse/src/cdp-bridge.ts` fail CI via the static-grep tripwire in
+`browse/test/cdp-session-cleanup.test.ts`. Use `withCdpSession(page, async (s) => {...})`
+for one-shot CDP work (try/finally detach) or `getOrCreateCdpSession(page, cache)`
+for cached sessions tied to a page's lifetime (close-detach via `Map<page, session>`).
+Three sites migrated: cdp-bridge frame events, write-commands archive capture,
+cdp-inspector. The helpers prevent the per-session leak class where successful-path
+detach happened but error-path detach was missed.
+
+**Setup symlink hardening** (v1.38.0.0+). Every link site in `setup` MUST route
+through the `_link_or_copy SRC DST` helper near the `IS_WINDOWS` detection. On
+Windows without Developer Mode, plain `ln -snf` produces frozen file copies that
+don't refresh on `git pull` — silent staleness across every host adapter. The
+helper preserves `ln -snf` on Unix and switches to `cp -R` / `cp -f` on Windows.
+`test/setup-windows-fallback.test.ts` enforces a static invariant: a single raw
+`ln` call outside the helper body fails CI. Windows users get a one-line note
+from `_print_windows_copy_note_once` reminding them to re-run `./setup` after
+every `git pull`.
+
 **Sidebar security stack** (layered defense against prompt injection):
 
 | Layer | Module | Lives in |
 |-------|--------|----------|
-| L1-L3 | `content-security.ts` | both server and agent — datamarking, hidden element strip, ARIA regex, URL blocklist, envelope wrapping |
-| L4 | `security-classifier.ts` (TestSavantAI ONNX) | **sidebar-agent only** |
-| L4b | `security-classifier.ts` (Claude Haiku transcript) | **sidebar-agent only** |
-| L5 | `security.ts` (canary) | both — inject in compiled, check in agent |
-| L6 | `security.ts` (combineVerdict ensemble) | both |
+| L1-L3 | `content-security.ts` | server + read path — datamarking, hidden element strip, ARIA regex, URL blocklist, envelope wrapping |
+| L4 | `security-classifier.ts` (TestSavantAI ONNX) | **security sidecar subprocess only** (`security-sidecar-entry.ts`, driven by `security-sidecar-client.ts` from server.ts) |
+| Canary | `security.ts` (generate/inject/detect) | pure utilities — no production injector today (the chat prompt-builder that injected them was ripped) |
+| Combiner | `security.ts` (combineVerdict + THRESHOLDS) | pure, tested; retains transcript/deberta vote handling for LayerSignal inputs no live layer produces anymore |
+
+History note: an L4b Haiku transcript classifier and an opt-in DeBERTa ensemble
+(`GSTACK_SECURITY_ENSEMBLE=deberta`) existed until the chat-path agent that
+invoked them was ripped; both were deleted as dead code (zero production
+callers). Do not re-document them as live.
 
 **Critical constraint:** `security-classifier.ts` CANNOT be imported from the
 compiled browse binary. `@huggingface/transformers` v4 requires `onnxruntime-node`
-which fails to `dlopen` from Bun compile's temp extract dir. Only `security.ts`
-(pure-string operations — canary, verdict combiner, attack log, status) is safe
-for `server.ts`. See `~/.gstack/projects/garrytan-gstack/ceo-plans/2026-04-19-prompt-injection-guard.md`
-§"Pre-Impl Gate 1 Outcome" for full architectural decision.
+which fails to `dlopen` from Bun compile's temp extract dir — hence the sidecar
+subprocess. Only `security.ts` (pure-string operations — canary utilities,
+verdict combiner, status) is safe for `server.ts`. See
+`~/.gstack/projects/garrytan-gstack/ceo-plans/2026-04-19-prompt-injection-guard.md`
+§"Pre-Impl Gate 1 Outcome" for the original architectural decision.
 
-**Thresholds** (in `security.ts`):
-- `BLOCK: 0.85` — single-layer score that would cause BLOCK if cross-confirmed
-- `WARN: 0.60` — cross-confirm threshold. When L4 AND L4b both >= 0.60 → BLOCK
-- `LOG_ONLY: 0.40` — gates transcript classifier (skip Haiku when all layers < 0.40)
-
-**Ensemble rule:** BLOCK only when the ML content classifier AND the transcript
-classifier both report >= WARN. Single-layer high confidence degrades to WARN —
-this is the Stack Overflow instruction-writing FP mitigation. Canary leak
-always BLOCKs (deterministic).
+**Thresholds** (in `security.ts`): `BLOCK: 0.85`, `WARN: 0.75`, `LOG_ONLY: 0.40`,
+`SOLO_CONTENT_BLOCK: 0.92` (label-less content classifiers can't distinguish
+"injection" from "phishing aimed at the user", so their solo bar is higher).
+The live L4 path applies these in server.ts's sidecar-scan handling; canary
+leak always BLOCKs (deterministic).
 
 **Env knobs:**
 - `GSTACK_SECURITY_OFF=1` — emergency kill switch. Classifier stays off even if
-  warmed. Canary is still injected; just the ML scan is skipped.
-- `GSTACK_SECURITY_ENSEMBLE=deberta` — opt-in DeBERTa-v3 ensemble. Adds
-  ProtectAI DeBERTa-v3-base-injection-onnx as L4c classifier for cross-model
-  agreement. 721MB first-run download. With ensemble enabled, BLOCK requires
-  2-of-3 ML classifiers agreeing at >= WARN (testsavant, deberta, transcript).
-  Without ensemble (default), BLOCK requires testsavant + transcript at >= WARN.
+  warmed; the L1-L3 filters keep running.
 - Classifier model cache: `~/.gstack/models/testsavant-small/` (112MB, first run only)
-  plus `~/.gstack/models/deberta-v3-injection/` (721MB, only when ensemble enabled)
-- Attack log: `~/.gstack/security/attempts.jsonl` (salted sha256 + domain only,
-  rotates at 10MB, 5 generations)
-- Per-device salt: `~/.gstack/security/device-salt` (0600)
-- Session state: `~/.gstack/security/session-state.json` (cross-process, atomic)
+- Attack log: `~/.gstack/security/attempts.jsonl` — written by
+  `tunnel-denial-log.ts` (tunnel-surface rejections; rotates at 10MB, 5 generations)
+
+History note (#2557): the cross-process session state
+(`~/.gstack/security/session-state.json`), `getStatus()`, the `/health`
+`security` field, and the sidepanel SEC shield were all removed — the state
+file lost its only writer when sidebar-agent.ts was ripped, so the shield
+reported a permanent 'inactive' or a stale false-green 'protected' from
+leftover disk state. The live defenses (L1-L3 filters, L4 sidecar on the
+inject-scan path) report through their own call sites, never through
+/health. `browse/test/server-security-surface.test.ts` pins both the
+removal and the live L4 wiring. Do not re-document these as live.
 
 ## Dev symlink awareness
 
@@ -325,8 +468,11 @@ symlink or a real copy. If it's a symlink to your working directory, be aware th
   global install at `~/.claude/skills/gstack/` is used instead
 
 **Prefix setting:** Setup creates real directories (not symlinks) at the top level
-with a SKILL.md symlink inside (e.g., `qa/SKILL.md -> gstack/qa/SKILL.md`). This
-ensures Claude discovers them as top-level skills, not nested under `gstack/`.
+with a SKILL.md symlink inside (e.g., `qa/SKILL.md -> gstack/qa/SKILL.md`), plus
+links to each skill's runtime assets (sections/, templates, checklists — everything
+except SKILL.md, tests, build output, and `.tmpl` sources). Alias skills
+(`_gstack-command`, `connect-chrome`) install as rewritten copies, never symlinks.
+This ensures Claude discovers them as top-level skills, not nested under `gstack/`.
 Names are either short (`qa`) or namespaced (`gstack-qa`), controlled by
 `skill_prefix` in `~/.gstack/config.yaml`. Pass `--no-prefix` or `--prefix` to
 skip the interactive prompt.
@@ -344,19 +490,59 @@ migration script to `gstack-upgrade/migrations/`. Read CONTRIBUTING.md's "Upgrad
 migrations" section for the format and testing requirements. The upgrade skill runs
 these automatically after `./setup` during `/gstack-upgrade`.
 
-## Compiled binaries — NEVER commit browse/dist/ or design/dist/
+## Compiled binaries — never commit browse/dist/, design/dist/, or make-pdf/dist/
 
-The `browse/dist/` and `design/dist/` directories contain compiled Bun binaries
-(`browse`, `find-browse`, `design`, ~58MB each). These are Mach-O arm64 only — they
-do NOT work on Linux, Windows, or Intel Macs. The `./setup` script already builds
-from source for every platform, so the checked-in binaries are redundant. They are
-tracked by git due to a historical mistake and should eventually be removed with
-`git rm --cached`.
+The `browse/dist/`, `design/dist/`, and `make-pdf/dist/` directories contain
+compiled Bun binaries (`browse`, `find-browse`, `design`, ~62MB each). These are
+Mach-O arm64 only — they do NOT work on Linux, Windows, or Intel Macs. The
+`./setup` script builds from source for every platform.
 
-**NEVER stage or commit these files.** They show up as modified in `git status`
-because they're tracked despite `.gitignore` — ignore them. When staging files,
-always use specific filenames (`git add file1 file2`) — never `git add .` or
-`git add -A`, which will accidentally include the binaries.
+These directories are **untracked and gitignored** (`.gitignore:3-6`; the
+`browse/dist/` binaries were untracked in `64d5a3e4`, v0.11.16.0; the others were
+never tracked). They will NOT appear in `git status`. If a dist binary ever does
+show up in `git status`, something force-added it (`git add -f`) — do not commit
+it; unstage it and find out how it got there.
+
+When staging files, always use specific filenames (`git add file1 file2`) — never
+`git add .` or `git add -A`, which can sweep in build outputs and junk.
+
+## Redaction guard (PII / secrets / legal content)
+
+Shared redaction engine catches credentials, PII, and legal/damaging content
+before it reaches an external sink (codex dispatch, GitHub issue/PR body, pushed
+commit). It is a **guardrail, not airtight enforcement** — `git push --no-verify`,
+direct `gh issue create`, and `GSTACK_REDACT_PREPUSH=skip` all bypass it. It
+catches accidents and carelessness, the 99% case. Do not claim it stops a
+determined leaker (a CHANGELOG line that does would fail a hostile screenshotter).
+
+- **Engine + taxonomy:** `lib/redact-patterns.ts` (the single source of truth —
+  3 tiers; HIGH = genuinely-secret credentials that block, MEDIUM = PII/legal/
+  internal + high-FP credential shapes that confirm via AskUserQuestion, LOW =
+  FYI) and `lib/redact-engine.ts` (pure `scan()` + `applyRedactions()`).
+  Calibration matters: a gate that cries wolf gets ignored, so context-variable
+  shapes (Stripe `pk_live_`, Google `AIza`, JWT, env `*_KEY=`) sit at MEDIUM.
+- **CLI:** `bin/gstack-redact` (exit 0 clean / 2 MEDIUM / 3 HIGH; `--json`,
+  `--auto-redact`, `--repo-visibility`, `--from-file`). `bin/gstack-redact-prepush`
+  is the opt-in git hook.
+- **Skill docs are generated** from `scripts/resolvers/redact-doc.ts`
+  (`{{REDACT_INVOCATION_BLOCK:<sink>}}`) so /spec,
+  /cso, /ship, /document-release, /document-generate never drift from the engine.
+- **Scan-at-sink:** always scan the EXACT bytes that will be sent — write to a
+  temp file, scan that file, pass the SAME file to `gh`/`git`. Never scan a string
+  then re-render (that reopens a scan-vs-send gap).
+- **Visibility (no tier promotion):** resolve once per run, order = local config
+  (`gstack-config get redact_repo_visibility`, ~/.gstack so never committed) → gh
+  → glab → unknown(=public-strict). Public repos get STERNER per-finding
+  confirmation (no batch-acknowledge, no silent-proceed); MEDIUM is never
+  auto-promoted to HIGH.
+- **Tool-attributed fences:** wrap Codex/Greptile/eval output in ` ```codex-review `
+  / ` ```greptile ` fences so example credentials those tools quote WARN-degrade
+  instead of blocking. A live-format credential inside the fence still blocks.
+- **Config keys:** `redact_repo_visibility` (public|private|unknown, local-only
+  override for repos gh/glab can't read), `redact_prepush_hook` (true|false).
+  There is intentionally NO key to disable HIGH blocking.
+- **Audit:** the /spec semantic pass appends a content-free record (categories +
+  body sha256, no spec text) to `~/.gstack/security/semantic-reviews.jsonl` (0600).
 
 ## Commit style
 
@@ -448,6 +634,36 @@ Even if the agent strongly believes a change improves the project, these three
 categories require explicit user approval via AskUserQuestion. No exceptions.
 No auto-merging. No "I'll just clean this up."
 
+## Checking out PRs from garrytan-agents
+
+When the user says "check out <PR link>" and the PR is from `garrytan-agents/gstack`
+(or any other fork that is NOT a collaborator on `garrytan/gstack`), do NOT just
+`gh pr checkout`. Fork PRs don't receive base-repo secrets (`ANTHROPIC_API_KEY`,
+`OPENAI_API_KEY`, etc.), so the eval/E2E CI jobs fail with empty-env auth errors
+regardless of what's set on the base repo.
+
+**Workflow:** push the branch to `garrytan/gstack` (the base repo) and re-target
+the PR from there.
+
+Concretely, after `gh pr checkout <N>`:
+
+1. Note the original PR number and head branch name.
+2. Push the same branch to the base repo: `git push origin HEAD:<branch-name>`
+   (origin = `garrytan/gstack`, since the worktree is set up with that remote).
+3. Close the fork PR (`gh pr close <N> --comment "moving to base-repo branch for secret access"`).
+4. Open a new PR from the base-repo branch: `gh pr create --base main --head <branch-name>`.
+5. New PR's workflows will get secrets automatically.
+
+Why not fix it on the fork side? `garrytan-agents` isn't a collaborator on
+`garrytan/gstack`. Adding it as a collaborator (option A) or flipping the
+repo-wide "send secrets to fork PRs" toggle (option B) would let secrets reach
+fork PRs from anyone — broader blast radius than just moving this one branch.
+Option C (this section) keeps secret-distribution scope tight.
+
+If the user asks you to skip the move (e.g., "just leave it as a fork PR"),
+respect that — eval CI will fail with empty-env auth, but check-freshness,
+workflow-lint, and windows-tests will still pass on the fork PR.
+
 ## CHANGELOG + VERSION style
 
 **Versioning invariant (workspace-aware ship).** VERSION is a monotonic ordered
@@ -459,6 +675,17 @@ claims v1.7.0.0 as a MINOR and branch B is also a MINOR, B lands at v1.8.0.0
 "MINOR = feature-only, PATCH = fix-only" as a strict contract. This is why
 `bin/gstack-next-version` advances within the chosen bump level rather than
 repicking the level when collisions happen.
+
+**package.json carries the npm-valid translation, not VERSION verbatim.**
+VERSION stays the 4-digit source of truth (e.g. `1.67.0.0`); package.json and
+any subdirectory manifests with a `version` field get the 3-digit npm-valid
+translation (`1.67.0`), and lockfile `version` fields sync only when the
+lockfile already exists. `bin/gstack-version-bump` (via `lib/version-source.ts`)
+owns the translation and judges drift on translated forms — do NOT "fix" the
+apparent mismatch by hand, and do not write a 4-digit version into
+package.json (npm rejects it). Rationale and translation rules live in the
+`lib/version-source.ts` header; `test/gstack-version-bump.test.ts` pins the
+contract.
 
 **Scale-aware bumps — use common sense.** When the diff is big, bump MINOR (or
 MAJOR), not PATCH. PATCH is for bug fixes and small additions; MINOR is for
@@ -648,8 +875,10 @@ When estimating or discussing effort, always show both human-team and CC+gstack 
 | Research / exploration | 1 day | 3 hours | ~3x |
 
 Completeness is cheap. Don't recommend shortcuts when the complete implementation
-is a "lake" (achievable) not an "ocean" (multi-quarter migration). See the
-Completeness Principle in the skill preamble for the full philosophy.
+is achievable. Boil the ocean — the complete thing is the goal; only genuinely
+unrelated multi-quarter migrations are separate scope, never an excuse for a
+shortcut. See the Completeness Principle in the skill preamble for the full
+philosophy.
 
 ## Search before building
 
@@ -697,6 +926,48 @@ The full E2E suite can take 30-45 minutes. That's 10-15 polling cycles. Do all o
 them. Report progress at each check (which tests passed, which are running, any
 failures so far). The user wants to see the run complete, not a promise that
 you'll check later.
+
+## Running evals as an agent: always detach (SIGTERM-proof)
+
+When **you (an agent/harness)** launch a long eval/benchmark run, run it through
+`bin/gstack-detach` — NEVER as a plain backgrounded Bash task. A plain background
+task lives in the harness's process group, so a SIGTERM ("polite quit") on a turn
+boundary, a stopped Monitor, or an interruption kills the run mid-flight (observed:
+`script "test:gate" was terminated by signal SIGTERM` ~40 min into a run). On macOS
+the run can also die to idle-sleep. `gstack-detach` fixes both: a fresh session
+(escapes the group SIGTERM) wrapped in `caffeinate -i` (blocks idle-sleep).
+
+- Use the `eval:bg*` scripts (`eval:bg`, `eval:bg:all`, `eval:bg:gate`,
+  `eval:bg:periodic`) — they wrap the eval command in `gstack-detach` with the
+  machine-wide `gstack-evals` lock (concurrent worktrees serialize instead of
+  saturating the shared model API), a per-tier watchdog, and a **run-scoped** log
+  under `~/.gstack-dev/eval-runs/` (no shared-`/tmp` collision). Each prints its
+  log path. `eval:bg:gate` / `eval:bg:periodic` run their tier through the
+  sharded paid runner (`scripts/test-paid-shards.ts`, also exposed as
+  `test:gate:sharded` / `test:periodic:sharded`): one Bun process per test
+  file, an external wall-clock timeout that kills the shard's process GROUP
+  (stray `claude`/`codex` grandchildren included), a per-shard
+  `GSTACK_EVAL_DIR=<evalDir>/shards/<slug>/` honored by the `EvalCollector`
+  constructor, and an aggregate that separates failed vs timed-out vs
+  never-started shards — the detach timeouts (25200s gate / 32400s periodic;
+  floor enforced against the live shard census by
+  test/eval-detach-timeout-floor.test.ts)
+  are sized against worst-case shard wall clock. `EVALS_JOBS` sets the shard
+  process count (default 4); `EVALS_CONCURRENCY` is bun's --max-concurrency
+  WITHIN a shard (default 4) — they are deliberately separate knobs. `eval:list` / `eval:compare` /
+  `eval:summary` read the shard dirs too. Or call
+  `gstack-detach [--lock NAME] [--timeout SECS] [--label LBL] --
+  <cmd>` directly for any long agent job. Export `ANTHROPIC_API_KEY` first (never
+  pass keys in argv).
+- Then **poll the printed logfile** with a death-aware watcher: break on the
+  guaranteed `### gstack-detach EXIT=<code> ###` sentinel (success AND failure are
+  both marked, so silence is never mistaken for success). The detached run survives
+  even if your watcher gets reaped, so re-checking the log always works.
+- Why the lock: a shared dev box with several Conductor worktrees will rate-limit
+  the model API if two eval suites run at once (15-way concurrency each), which
+  mass-times-out E2E tests. The lock makes the second run WAIT, not collide.
+- Humans running `bun run test:evals` foreground in their own terminal don't need
+  this — Ctrl-C is intended there. Detachment is for agent-launched runs only.
 
 ## E2E test fixtures: extract, don't copy
 
@@ -753,6 +1024,12 @@ The active skill lives at `~/.claude/skills/gstack/`. After making changes:
 2. Fetch and reset in the skill directory: `cd ~/.claude/skills/gstack && git fetch origin && git reset --hard origin/main`
 3. Rebuild: `cd ~/.claude/skills/gstack && bun run build`
 
+**If you use gbrain:** the `git reset --hard` in step 2 reverts the brain-aware
+(`GBRAIN_CONTEXT_LOAD` / `GBRAIN_SAVE_RESULTS`) blocks that `gstack-config
+gbrain-refresh` renders into the install (those generated blocks differ from
+`main` by design). After deploying, re-run `gstack-config gbrain-refresh` to
+restore them across all your projects' Claude sessions. It's idempotent.
+
 Or copy the binaries directly:
 - `cp browse/dist/browse ~/.claude/skills/gstack/browse/dist/browse`
 - `cp design/dist/design ~/.claude/skills/gstack/design/dist/design`
@@ -774,3 +1051,71 @@ Key routing rules:
 - Ship/deploy/PR → invoke /ship or /land-and-deploy
 - Save progress → invoke /context-save
 - Resume context → invoke /context-restore
+
+## Cross-session decision memory
+
+Durable decisions and their rationale are captured in an append-only, event-sourced
+store at `~/.gstack/projects/<slug>/decisions.jsonl` so neither you nor the user
+re-litigates a settled call or loses the "why" across sessions. This is the reliable,
+file-only path: it works with gbrain OFF. (gbrain semantic recall is an optional
+enhancement layered on top, never a dependency.)
+
+- **Resurface** active decisions before re-deciding: `bin/gstack-decision-search`
+  (`--recent N`, `--scope repo|branch|issue`, `--query KW`, `--all`, `--json`).
+  Add `--semantic` (with `--query`) to append related hits from gbrain memory when
+  it's up; it degrades silently to the reliable file results when gbrain is off.
+  Session start already surfaces scope-relevant active decisions via Context Recovery.
+  If a decision is listed, treat it as settled with its rationale; if you're about to
+  reverse it, say so explicitly.
+- **Capture** a DURABLE decision when you or the user make one:
+  `bin/gstack-decision-log '{"decision":"...","rationale":"...","scope":"repo|branch|issue","source":"user|skill|agent","confidence":1-10}'`.
+  Reverse a prior call with `--supersede <id>`; expunge an accidental secret with
+  `--redact <id>`; rewrite the log to the active set with `--compact`. Non-interactive
+  (never prompts), injection-sanitized, and HIGH-secret-blocking on write.
+- **Durable means:** architecture choice, scope cut, tool/vendor choice, or a reversal
+  of a prior call. NOT a turn-level edit, a phrasing tweak, or anything trivially
+  re-derivable. Capture is curated at the source — log durable decisions only, or the
+  store becomes noise.
+
+## GBrain Search Guidance (configured by /sync-gbrain)
+<!-- gstack-gbrain-search-guidance:start -->
+
+GBrain is set up and synced on this machine. The agent should prefer gbrain
+over Grep when the question is semantic or when you don't know the exact
+identifier yet.
+
+**This worktree is pinned to a worktree-scoped code source** via the
+`.gbrain-source` file in the repo root (kubectl-style context). Any
+`gbrain code-def`, `code-refs`, `code-callers`, `code-callees`, or `query`
+call from anywhere under this worktree routes to that source by default —
+no `--source` flag needed. Conductor sibling worktrees of the same repo
+each have their own pin and their own indexed pages, so semantic results
+match the actual code on disk in this worktree.
+
+Two indexed corpora available via the `gbrain` CLI:
+- This worktree's code (auto-pinned via `.gbrain-source`).
+- `~/.gstack/` curated memory (registered as `gstack-brain-<user>` source via
+  the existing federation pipeline).
+
+Prefer gbrain when:
+- "Where is X handled?" / semantic intent, no exact string yet:
+    `gbrain search "<terms>"` or `gbrain query "<question>"`
+- "Where is symbol Y defined?" / symbol-based code questions:
+    `gbrain code-def <symbol>` or `gbrain code-refs <symbol>`
+- "What calls Y?" / "What does Y depend on?":
+    `gbrain code-callers <symbol>` / `gbrain code-callees <symbol>`
+- "What did we decide last time?" / past plans, retros, learnings:
+    `gbrain search "<terms>" --source gstack-brain-<user>`
+
+Grep is still right for known exact strings, regex, multiline patterns, and
+file globs. Run `/sync-gbrain` after meaningful code changes; for ongoing
+auto-sync across all worktrees, run `gbrain autopilot --install` once per
+machine — gbrain's daemon handles incremental refresh on a schedule.
+
+Safety: don't run `/sync-gbrain` while `gbrain autopilot` is active — the
+orchestrator refuses destructive source ops when it detects a running autopilot
+to avoid racing it (#1734). Prefer registering user repos with `gbrain sources
+add --path <dir>` (no `--url`): URL-managed sources can auto-reclone, and the
+sync code walk for them requires an explicit `--allow-reclone` opt-in.
+
+<!-- gstack-gbrain-search-guidance:end -->

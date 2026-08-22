@@ -28,8 +28,11 @@ afterEach(() => {
 });
 
 function run(...args: string[]): { stdout: string; stderr: string; status: number } {
+  // gstack-config precedence is `${GSTACK_HOME:-${GSTACK_STATE_DIR:-$HOME/.gstack}}`,
+  // so GSTACK_HOME from the developer's parent env wins over the test's
+  // GSTACK_STATE_DIR. Override both to isolate from the real ~/.gstack.
   const res = spawnSync(BIN_CONFIG, args, {
-    env: { ...process.env, GSTACK_STATE_DIR: tmpHome },
+    env: { ...process.env, GSTACK_STATE_DIR: tmpHome, GSTACK_HOME: tmpHome },
     encoding: 'utf-8',
     cwd: ROOT,
   });
@@ -59,9 +62,13 @@ describe('gstack-config explain_level', () => {
     expect(run('get', 'explain_level').stdout).toBe('default');
   });
 
-  test('get with unset explain_level returns empty (preamble default takes over)', () => {
-    // No prior set → no config file → empty output
-    expect(run('get', 'explain_level').stdout).toBe('');
+  test('get with unset explain_level returns the documented default', () => {
+    // gstack-config returns the documented default ("default") when the
+    // key is absent from config.yaml — see bin/gstack-config:103. Earlier
+    // versions of this test expected "" (preamble shell substitution),
+    // but the script ships defaults inline so callers always get a
+    // usable value without bash fallback gymnastics.
+    expect(run('get', 'explain_level').stdout).toBe('default');
   });
 
   test('config header documents explain_level', () => {
@@ -79,5 +86,22 @@ describe('gstack-config explain_level', () => {
     const garbage = run('set', 'explain_level', 'nonsense');
     expect(garbage.stderr).toContain('not recognized');
     expect(run('get', 'explain_level').stdout).toBe('default');
+  });
+});
+
+describe('gstack-config values with spaces', () => {
+  test('workspace_root preserves internal spaces on set/get/list', () => {
+    const value = path.join(os.tmpdir(), 'Conductor Workspaces');
+    expect(run('set', 'workspace_root', value).status).toBe(0);
+
+    expect(run('get', 'workspace_root').stdout).toBe(value);
+
+    const listed = run('list');
+    expect(listed.status).toBe(0);
+    expect(
+      listed.stdout
+        .split('\n')
+        .some((line) => line.includes('workspace_root:') && line.includes(value) && line.includes('(set)')),
+    ).toBe(true);
   });
 });

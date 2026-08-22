@@ -157,7 +157,9 @@ describe('sidepanel-terminal.js: eager auto-connect + injection API', () => {
   test('forceRestart helper closes ws, disposes xterm, returns to IDLE', () => {
     expect(TERM_JS).toContain('function forceRestart');
     const fn = TERM_JS.slice(TERM_JS.indexOf('function forceRestart'));
-    expect(fn).toContain('ws && ws.close()');
+    // close() carries an intentional-restart close code so the agent's
+    // close handler can distinguish user restarts from network drops.
+    expect(fn).toContain("ws && ws.close(4001, 'intentional-restart')");
     expect(fn).toContain('term.dispose()');
     expect(fn).toContain('STATE.IDLE');
     expect(fn).toContain('tryAutoConnect()');
@@ -203,8 +205,9 @@ describe('server.ts: chat / sidebar-agent endpoints are gone', () => {
     expect(slice).not.toContain('agentStatus');
     expect(slice).not.toContain('messageQueue');
     expect(slice).not.toContain('agentStartTime');
-    // chatEnabled is hardcoded false now (older clients still see the field).
-    expect(slice).toMatch(/chatEnabled:\s*false/);
+    // chatEnabled is gone entirely — the chat pane no longer exists in any
+    // extension build, so /health stopped advertising a chat mode.
+    expect(slice).not.toContain('chatEnabled');
     // terminalPort survives.
     expect(slice).toContain('terminalPort');
   });
@@ -222,8 +225,17 @@ describe('cli.ts: sidebar-agent is no longer spawned', () => {
   });
 
   test('Terminal-agent spawn survives', () => {
-    expect(CLI_SRC).toContain('terminal-agent.ts');
-    expect(CLI_SRC).toMatch(/Bun\.spawn\(\['bun',\s*'run',\s*termAgentScript\]/);
+    // v1.44 moved the raw Bun.spawn into the shared spawnTerminalAgent
+    // helper (terminal-agent-control.ts) so cli.ts, the supervisor respawn
+    // loop, and the watchdog all share identity-based process control.
+    // cli.ts must still route through that helper.
+    expect(CLI_SRC).toContain('spawnTerminalAgent');
+    const CONTROL_SRC = fs.readFileSync(
+      path.join(import.meta.dir, '../src/terminal-agent-control.ts'),
+      'utf-8',
+    );
+    expect(CONTROL_SRC).toContain('terminal-agent.ts');
+    expect(CONTROL_SRC).toMatch(/\.spawn\(\['bun',\s*'run',\s*script\]/);
   });
 });
 
@@ -252,5 +264,17 @@ describe('manifest: ws permission + xterm-safe CSP', () => {
     if (csp && csp.extension_pages) {
       expect(csp.extension_pages).not.toContain('unsafe-eval');
     }
+  });
+});
+
+describe('manifest: live tab awareness needs "tabs" permission', () => {
+  // Without "tabs", chrome.tabs.query() returns tab objects with undefined
+  // url/title for any site outside host_permissions (e.g., everything except
+  // 127.0.0.1). snapshotTabs() then writes empty strings into tabs.json and
+  // active-tab.json silently skips the write — the sidebar agent loses track
+  // of what page the user is on. activeTab is too narrow (only after a user
+  // gesture on the extension action) for background polling.
+  test('permissions includes "tabs"', () => {
+    expect(MANIFEST.permissions).toContain('tabs');
   });
 });

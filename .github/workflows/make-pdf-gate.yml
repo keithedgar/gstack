@@ -4,6 +4,8 @@ on:
     branches: [main]
     paths:
       - 'make-pdf/**'
+      - 'lib/diagram-render/**'
+      - 'test/diagram-render-drift.test.ts'
       - 'browse/src/meta-commands.ts'
       - 'browse/src/write-commands.ts'
       - 'browse/src/commands.ts'
@@ -14,7 +16,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: make-pdf-gate-${{ github.head_ref }}
+  group: make-pdf-gate-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
 jobs:
@@ -22,7 +24,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # macOS only: the Linux leg became redundant when the free-tests lane
+        # started running make-pdf/test (incl. e2e/) on every PR via the
+        # canonical runner — this gate's remaining value is macOS rendering
+        # coverage on make-pdf-scoped changes.
+        os: [macos-latest]
         # Windows is tolerant-mode — Xpdf / Poppler-Windows extraction
         # differs enough from the Linux/macOS baseline that the strict
         # exact-diff gate is unreliable. Enable once the normalized
@@ -34,7 +40,7 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -48,8 +54,17 @@ jobs:
         run: brew install poppler
 
       - name: Install poppler-utils (Ubuntu)
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubicloud-standard-8'
         run: sudo apt-get update && sudo apt-get install -y poppler-utils
+
+      # Install a color-emoji font BEFORE Chromium launches so the emoji render
+      # gate has a fallback font. macOS ships Apple Color Emoji already.
+      - name: Install color-emoji font (Ubuntu)
+        if: matrix.os == 'ubicloud-standard-8'
+        run: |
+          sudo apt-get install -y fonts-noto-color-emoji
+          fc-cache -f || true
+          fc-match -f '%{family[0]}\t%{color}\n' ':lang=und-zsye:charset=1F600' || true
 
       - name: Install Playwright Chromium
         run: bunx playwright install chromium
@@ -72,9 +87,9 @@ jobs:
           which pdftotext && pdftotext -v 2>&1 | head -1 || true
 
       - name: Run make-pdf unit tests
-        run: bun test make-pdf/test/*.test.ts
+        run: bun test make-pdf/test/*.test.ts test/diagram-render-drift.test.ts
 
-      - name: Run combined-features copy-paste gate (P0)
+      - name: Run E2E gates (combined-features copy-paste + emoji render)
         env:
           BROWSE_BIN: ${{ github.workspace }}/browse/dist/browse
-        run: bun test make-pdf/test/e2e/combined-gate.test.ts
+        run: bun test make-pdf/test/e2e/

@@ -12,7 +12,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import {
-  rotateRoot, initRegistry, validateToken, listTokens,
+  initRegistry, validateToken, listTokens, __resetRegistry,
 } from '../src/token-registry';
 import {
   handleSkillCommand,
@@ -26,7 +26,9 @@ let tmpRoot: string;
 let tiers: TierPaths;
 
 beforeEach(() => {
-  rotateRoot();
+  // __resetRegistry zeroes rootToken so the new initRegistry mismatch guard
+  // doesn't fire on the immediate initRegistry call.
+  __resetRegistry();
   initRegistry('root-token-for-tests');
   tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'browser-skill-cmd-test-'));
   tiers = {
@@ -176,7 +178,17 @@ describe('buildSpawnEnv', () => {
     process.env.LANG = 'en_US.UTF-8';
   });
   afterEach(() => {
-    process.env = origEnv;
+    // process.env = origEnv replaces only the reference; the underlying
+    // env stays mutated and leaks to later test files in the same Bun
+    // process (e.g., breaks Bun.which('bash') in security.test.ts and
+    // bun-spawn in pair-agent-tunnel-eval.test.ts). Delete every current
+    // key then re-assign from the snapshot — restores the actual env.
+    for (const k of Object.keys(process.env)) {
+      if (!(k in origEnv)) delete process.env[k];
+    }
+    for (const [k, v] of Object.entries(origEnv)) {
+      if (v !== undefined) process.env[k] = v;
+    }
   });
 
   it('untrusted: drops $HOME and secrets', () => {
@@ -291,7 +303,15 @@ describe.skipIf(SKIP_SPAWN)('spawnSkill: lifecycle', () => {
       expect(parsed.gh).toBeNull();
       expect(parsed.gstack).toBeNull();
     } finally {
-      process.env = origEnv;
+      // See afterEach comment in `buildSpawnEnv` describe — direct
+      // reassignment of process.env doesn't actually restore the
+      // underlying env in Bun. Delete + re-assign instead.
+      for (const k of Object.keys(process.env)) {
+        if (!(k in origEnv)) delete process.env[k];
+      }
+      for (const [k, v] of Object.entries(origEnv)) {
+        if (v !== undefined) process.env[k] = v;
+      }
     }
   });
 
@@ -310,7 +330,12 @@ describe.skipIf(SKIP_SPAWN)('spawnSkill: lifecycle', () => {
       const parsed = JSON.parse(result.stdout);
       expect(parsed.home).toBe('/Users/test-user');
     } finally {
-      process.env = origEnv;
+      for (const k of Object.keys(process.env)) {
+        if (!(k in origEnv)) delete process.env[k];
+      }
+      for (const [k, v] of Object.entries(origEnv)) {
+        if (v !== undefined) process.env[k] = v;
+      }
     }
   });
 
@@ -356,4 +381,43 @@ describe.skipIf(SKIP_SPAWN)('spawnSkill: lifecycle', () => {
     expect(result.truncated).toBe(true);
     expect(result.stdout.length).toBeLessThanOrEqual(1024 * 1024);
   }, 10_000);
+});
+
+describe('subprocess capture goes through temp files, not pipes', () => {
+  // Tripwire. Capturing a child's output through `stdout: 'pipe'` is lossy
+  // here: under a loaded parent, the first piped spawn in the process
+  // intermittently yields an empty stderr even though the child wrote it and
+  // exited 0. Neither draining before awaiting exit nor a manual getReader()
+  // loop avoids it — both were measured losing the same bytes. It flaked
+  // `$B skill test` (a dropped stderr left only bun's banner) and would blank
+  // a skill's JSON result on `$B skill run` while still reporting success.
+  //
+  // runToFiles() points the child's fds at temp files instead, so the kernel
+  // has flushed everything by the time the child exits. This test fails if a
+  // refactor reintroduces pipe capture in this module.
+  //
+  // Comments are stripped first, so the module's own prose — which names the
+  // banned pattern in order to explain it — doesn't trip checks meant for code.
+  const src = fs.readFileSync(
+    path.join(import.meta.dir, '..', 'src', 'browser-skill-commands.ts'), 'utf-8')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/^\s*\/\/.*$/gm, '');
+
+  it("does not spawn with stdout/stderr: 'pipe'", () => {
+    expect(src).not.toMatch(/std(out|err):\s*'pipe'/);
+  });
+
+  it('does not read child output via Response(proc.stdout/stderr) or getReader', () => {
+    expect(src).not.toMatch(/new Response\(\s*proc\.(stdout|stderr)/);
+    expect(src).not.toMatch(/proc\.(stdout|stderr)[\s\S]{0,40}getReader\(/);
+  });
+
+  it('every spawn site routes through runToFiles', () => {
+    // The structural invariant: runToFiles owns the module's only Bun.spawn,
+    // so any present or future spawn site inherits the file-based capture.
+    // Counted rather than name-checked so adding a spawn site that bypasses
+    // the helper fails here instead of silently reintroducing the bug.
+    expect(src.match(/Bun\.spawn\(/g) ?? []).toHaveLength(1);
+    expect((src.match(/await runToFiles\(/g) ?? []).length).toBeGreaterThanOrEqual(2);
+  });
 });

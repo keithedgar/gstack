@@ -14,33 +14,51 @@
  */
 
 import { BrowserManager } from './browser-manager';
-import { handleReadCommand } from './read-commands';
+import { handleReadCommand, hasOutArg } from './read-commands';
 import { handleWriteCommand } from './write-commands';
 import { handleMetaCommand } from './meta-commands';
 import { handleCookiePickerRoute, hasActivePicker } from './cookie-picker-routes';
-import { sanitizeExtensionUrl } from './sidebar-utils';
 import { COMMAND_DESCRIPTIONS, PAGE_CONTENT_COMMANDS, DOM_CONTENT_COMMANDS, wrapUntrustedContent, canonicalizeCommand, buildUnknownCommandError, ALL_COMMANDS } from './commands';
 import {
   wrapUntrustedPageContent, datamarkContent,
   runContentFilters, type ContentFilterResult,
   markHiddenElements, getCleanTextWithStripping, cleanupHiddenMarkers,
 } from './content-security';
-import { generateCanary, injectCanary, getStatus as getSecurityStatus, writeDecision } from './security';
+import { isSidecarAvailable, scanWithSidecar } from './security-sidecar-client';
+import { writeSecureFile, mkdirSecure, appendSecureFile } from './file-permissions';
 import { handleSnapshot, SNAPSHOT_FLAGS } from './snapshot';
 import {
   initRegistry, validateToken as validateScopedToken, checkScope, checkDomain,
   checkRate, createToken, createSetupKey, exchangeSetupKey, revokeToken,
-  rotateRoot, listTokens, serializeRegistry, restoreRegistry, recordCommand,
-  isRootToken, checkConnectRateLimit, type TokenInfo,
+  listTokens, recordCommand,
+  isRootToken, checkConnectRateLimit, type TokenInfo, type ScopeCategory,
+  DEFAULT_PAIR_SCOPES, InvalidScopeError, ReservedClientIdError, assertValidClientId,
+  assertValidTokenOptions, revokeSetupKeys, getClientSession, grantReducesAccess,
 } from './token-registry';
 import { validateTempPath } from './path-security';
-import { resolveConfig, ensureStateDir, readVersionHash } from './config';
+import { resolveConfig, ensureStateDir, readVersionHash, resolveChromiumProfile, cleanSingletonLocks, isPairAgentEnabled } from './config';
+import {
+  isSessionPersistEnabled, persistSessionState, restoreSessionState,
+  sessionPersistIntervalMs, SESSION_STATE_FILE,
+} from './session-persist';
 import { emitActivity, subscribe, getActivityAfter, getActivityHistory, getSubscriberCount } from './activity';
+import { createSseEndpoint } from './sse-helpers';
 import { initAuditLog, writeAuditEntry } from './audit';
 import { inspectElement, modifyStyle, resetModifications, getModificationHistory, detachSession, type InspectorResult } from './cdp-inspector';
 // Bun.spawn used instead of child_process.spawn (compiled bun binaries
 // fail posix_spawn on all executables including /bin/bash)
 import { safeUnlink, safeUnlinkQuiet, safeKill } from './error-handling';
+import {
+  findAvailablePort, formatExplicitPortUnavailableError, formatRandomPortUnavailableError,
+} from './port-allocator';
+import { readAgentRecord, killAgentByRecord, agentRecordPath, spawnTerminalAgent } from './terminal-agent-control';
+import { isProcessAlive } from './error-handling';
+import { sanitizeBody, stripLoneSurrogateEscapes, stripLoneSurrogates, sanitizeReplacer } from './sanitize';
+import { startSocksBridge, testUpstream, type BridgeHandle } from './socks-bridge';
+import { parseProxyConfig, toUpstreamConfig, ProxyConfigError } from './proxy-config';
+import { writeReceipt } from '../../lib/egress-receipt';
+import { redactProxyUrl } from './proxy-redact';
+import { shouldSpawnXvfb, pickFreeDisplay, spawnXvfb, xvfbInstallHint, type XvfbHandle } from './xvfb';
 import { logTunnelDenial } from './tunnel-denial-log';
 import {
   mintSseSessionToken, validateSseSessionToken, extractSseCookie,
@@ -49,10 +67,31 @@ import {
 import {
   mintPtySessionToken, buildPtySetCookie, revokePtySessionToken,
 } from './pty-session-cookie';
+import {
+  mintLease, validateLease, refreshLease, revokeLease,
+} from './pty-session-lease';
 import * as fs from 'fs';
 import * as net from 'net';
 import * as path from 'path';
 import * as crypto from 'crypto';
+
+// ─── Unicode Sanitization ───────────────────────────────────────
+// Unpaired UTF-16 surrogate halves (\uD800–\uDFFF) in page DOM text, OCR
+// output, and other CDP-sourced strings are rejected by JSON consumers
+// downstream (Anthropic API in particular: "no low surrogate in string").
+// The sanitizers live in sanitize.ts (single source of truth, shared with
+// sse-helpers.ts and the read/snapshot pipeline): `stripLoneSurrogates`
+// replaces lone halves with U+FFFD (valid pairs like emoji survive), and
+// `sanitizeReplacer` runs it on every string value inside JSON.stringify.
+//
+// INVARIANT: every server egress path that ships page-content strings MUST
+// route through the sanitizer. handleCommandInternal wraps the final
+// cr.result string (text/plain bodies carry lone surrogates verbatim;
+// JSON.stringify already escapes them). The SSE producers stringify with
+// `sanitizeReplacer` so payload string fields get cleaned BEFORE escaping.
+// Plain post-stringify regex is a no-op there because JSON.stringify
+// converts \uD800 → "\\ud800" — the regex can't see the surrogate after
+// that point.
 
 // ─── Config ─────────────────────────────────────────────────────
 const config = resolveConfig();
@@ -60,8 +99,35 @@ ensureStateDir(config);
 initAuditLog(config.auditLog);
 
 // ─── Auth ───────────────────────────────────────────────────────
-const AUTH_TOKEN = crypto.randomUUID();
-initRegistry(AUTH_TOKEN);
+// activeShutdown points to the factory-scoped shutdown function once
+// buildFetchHandler has been called. Module-level timers (idle check, parent
+// watchdog) and signal handlers route through activeShutdown so they close
+// the cfg-provided browserManager rather than a stale module-level reference.
+// Null before the first buildFetchHandler call, which is correct: nothing to
+// shut down yet.
+let activeShutdown: ((code?: number) => Promise<void>) | null = null;
+
+// AUTH_TOKEN is injectable via process.env.AUTH_TOKEN so embedders
+// (gbrowser's gbd daemon spawn) can pre-allocate the token and hand it to
+// the Bun child via env.
+//
+// Validation: require >= 16 chars after stripping ALL unicode whitespace
+// (not just ASCII — .trim() misses U+200B / U+FEFF / U+00A0 / etc., which
+// would otherwise let a misconfigured embedder ship a one-character BOM as
+// the bearer secret). Reject tokens that are too short or contain only
+// whitespace; fall back to randomUUID so the security boundary is never
+// silently weakened by misconfiguration.
+function sanitizeAuthToken(raw: string | undefined): string | null {
+  if (!raw) return null;
+  const stripped = raw.replace(/[\s ​-‍﻿]/g, '');
+  if (stripped.length < 16) return null;
+  return stripped;
+}
+// AUTH_TOKEN const + module-level initRegistry call deleted in v1.35.0.0.
+// buildFetchHandler now owns auth state end-to-end: cfg.authToken is the
+// single source of truth, factory body calls initRegistry(cfg.authToken),
+// and factory-scoped validateAuth closes over the same value. start() reads
+// env once via resolveConfigFromEnv() and threads the result through.
 const BROWSE_PORT = parseInt(process.env.BROWSE_PORT || '0', 10);
 const IDLE_TIMEOUT_MS = parseInt(process.env.BROWSE_IDLE_TIMEOUT || '1800000', 10); // 30 min
 
@@ -93,6 +159,126 @@ let tunnelServer: ReturnType<typeof Bun.serve> | null = null; // tunnel HTTP lis
 export type Surface = 'local' | 'tunnel';
 
 /**
+ * Factory contract for embedders (gbrowser phoenix overlay).
+ *
+ * Today the CLI calls `start()` which reads env vars and binds Bun.serve
+ * itself. Embedders building on this server as a submodule (gbrowser's
+ * fd-passing gbd architecture) need to inject auth + ports + a
+ * BrowserManager they pre-launched, and own the listener themselves.
+ *
+ * Status: v1 surfaces this type as documentation. AUTH_TOKEN env-injection
+ * is already live (see ~L70). `start()` is exported and the kickoff /
+ * signal-handler registration is gated on `import.meta.main`, so phoenix
+ * can `import { start } from '.../server'` without auto-starting. Full
+ * `buildFetchHandler` extraction lands in a follow-up; see plan
+ * `/Users/garrytan/.claude/plans/system-instruction-you-are-working-swirling-fountain.md`
+ * Part 1.
+ */
+export interface ServerConfig {
+  /** Bearer token clients must present. Today injected via AUTH_TOKEN env. */
+  authToken: string;
+  /** Local listener port. Used in /welcome URL + state-file. */
+  browsePort: number;
+  /** Result of resolveConfig() — stateDir, auditLog, stateFile. */
+  config: ReturnType<typeof resolveConfig>;
+  /** Pre-launched BrowserManager. Caller owns lifecycle. */
+  browserManager: BrowserManager;
+  // NOTE: per-factory idleTimeoutMs and chromiumProfile were deleted — they
+  // were documented but never read (the idle timer, activity state, and
+  // shutdown target are module-global, so per-factory wiring would lie for
+  // any embedder running >1 handler). Real support belongs to the deferred
+  // server.ts singleton/route-table refactor. Until then: BROWSE_IDLE_TIMEOUT
+  // and CHROMIUM_PROFILE env are the honest knobs.
+  /** Caller-owned. shutdown() does NOT call xvfb.stop(); caller is responsible. */
+  xvfb?: XvfbHandle | null;
+  /** Caller-owned. shutdown() does NOT call proxyBridge.close(); caller is responsible. */
+  proxyBridge?: BridgeHandle | null;
+  startTime: number;
+  /**
+   * Overlay hook. Runs AFTER gstack resolves auth and BEFORE route dispatch.
+   * Invalid tokens are auto-rejected at the gstack layer (401 returned
+   * before hook fires), so the hook only ever sees valid TokenInfo or null
+   * (no token presented). Returning a Response short-circuits gstack
+   * dispatch; returning null falls through.
+   */
+  beforeRoute?: (req: Request, surface: Surface, auth: TokenInfo | null) => Promise<Response | null>;
+  /**
+   * Whether gstack owns the lifecycle of the terminal-agent process and its
+   * discovery files (`<stateDir>/terminal-port`, `<stateDir>/terminal-internal-token`,
+   * `<stateDir>/terminal-agent-pid`).
+   *
+   * When true (default), shutdown() runs four side effects:
+   *   1. Identity-based kill via `killAgentByRecord(readAgentRecord(stateDir))`
+   *      (v1.44+). Only signals the PID recorded by THIS daemon's agent.
+   *      Replaced the historical `pkill -f terminal-agent\.ts` regex that
+   *      matched sibling gstack sessions on the same host — see
+   *      terminal-agent-control.ts for rationale.
+   *   2. `safeUnlinkQuiet(<stateDir>/terminal-port)`
+   *   3. `safeUnlinkQuiet(<stateDir>/terminal-internal-token)`
+   *   4. `safeUnlinkQuiet(<stateDir>/terminal-agent-pid)` (the v1.44 record)
+   *
+   * This is correct for gstack's CLI path, which spawns `terminal-agent.ts` as
+   * the producer of those files (see cli.ts:1037-1063).
+   *
+   * Embedders (gbrowser phoenix overlay, future hosts) that run their own PTY
+   * server and write those files themselves should pass `false`. When `false`,
+   * the embedder owns BOTH the agent process AND all three discovery files.
+   * Note that terminal-agent.ts's own SIGTERM cleanup removes `terminal-port`
+   * and `terminal-agent-pid` (the agent writes both at boot), so embedders
+   * that pre-launch their own agent must ensure their cleanup matches.
+   *
+   * Polarity note: this differs from `xvfb?` and `proxyBridge?`, which gate by
+   * the *presence* of a caller-owned handle (presence ⇒ don't close). This
+   * field gates by an explicit boolean because there is no handle object —
+   * the terminal-agent is started elsewhere (cli.ts), and shutdown's only
+   * reference is the PID record + the file paths.
+   */
+  ownsTerminalAgent?: boolean;
+}
+
+/**
+ * Return shape of buildFetchHandler() — fetch handlers + lifecycle helpers
+ * embedders need to drive their own Bun.serve binding. See ServerConfig.
+ */
+export interface ServerHandle {
+  fetchLocal: (req: Request, server: any) => Promise<Response>;
+  fetchTunnel: (req: Request, server: any) => Promise<Response>;
+  /**
+   * Drains buffers, kills terminal-agent, closes browser, clears intervals,
+   * removes state files. Does NOT stop bound Bun.Server listeners — call
+   * stopListeners() for that. CLI relies on process.exit() to drop sockets.
+   */
+  shutdown: (exitCode?: number) => Promise<void>;
+  /**
+   * Graceful listener stop for embedders. Calls server.stop(true) on each
+   * passed Bun.Server. CLI doesn't need this (process.exit handles it).
+   */
+  stopListeners: (local: any, tunnel?: any) => Promise<void>;
+}
+
+/**
+ * Build a ServerConfig-shaped object from process.env. Used by gstack's
+ * own CLI when running `bun run dev` or the compiled binary directly.
+ * Embedders construct their own ServerConfig explicitly.
+ *
+ * Reads env, calls resolveConfig(). Does NOT bind a listener or call
+ * initAuditLog/initRegistry — those happen inside the buildFetchHandler
+ * lifecycle.
+ */
+export function resolveConfigFromEnv(): Omit<ServerConfig, 'browserManager' | 'startTime'> & {
+  config: ReturnType<typeof resolveConfig>;
+} {
+  return {
+    // Same sanitizer as the module-level AUTH_TOKEN: strips ALL unicode
+    // whitespace and rejects tokens shorter than 16 chars so a misconfigured
+    // embedder can't ship a BOM/zero-width as the bearer secret.
+    authToken: sanitizeAuthToken(process.env.AUTH_TOKEN) || crypto.randomUUID(),
+    browsePort: parseInt(process.env.BROWSE_PORT || '0', 10),
+    config: resolveConfig(),
+  };
+}
+
+/**
  * Paths reachable over the tunnel surface. Everything else returns 404.
  *
  * `/connect` is the only unauthenticated tunnel endpoint — POST for setup-key
@@ -106,8 +292,18 @@ export type Surface = 'local' | 'tunnel';
 const TUNNEL_PATHS = new Set<string>([
   '/connect',
   '/command',
-  '/sidebar-chat',
 ]);
+
+/**
+ * The gstack sidebar extension's pinned Chrome extension ID. Derived from
+ * the "key" field in extension/manifest.json (first 16 bytes of SHA-256 of
+ * the DER public key, hex nibbles mapped 0-9a-f → a-p). Reproduce with:
+ *   bun browse/scripts/extension-id.ts
+ * POST /extension-token releases AUTH_TOKEN only to an Origin of exactly
+ * `chrome-extension://<this id>`. If the manifest keypair is ever rotated,
+ * this constant must be updated in the same commit.
+ */
+export const GSTACK_EXTENSION_ID = 'dgbkdbjebeiblbajiilljmhjdpmiglep';
 
 /**
  * Commands reachable via POST /command over the tunnel surface. A paired
@@ -134,9 +330,15 @@ export const TUNNEL_COMMANDS = new Set<string>([
  * without standing up an HTTP listener. Behavior is identical to the inline
  * check; the function canonicalizes the command (so aliases hit the same set)
  * and returns false for null/undefined input.
+ *
+ * `args` is consulted so an `--out` invocation (e.g. `eval --out <file>`) is
+ * NEVER tunnel-dispatchable: `--out` turns an otherwise-readable command into a
+ * local-disk WRITE, and the tunnel surface never grants disk-write capability to
+ * remote paired agents. Omitting `args` preserves the old command-only behavior.
  */
-export function canDispatchOverTunnel(command: string | undefined | null): boolean {
+export function canDispatchOverTunnel(command: string | undefined | null, args?: string[]): boolean {
   if (typeof command !== 'string' || command.length === 0) return false;
+  if (Array.isArray(args) && hasOutArg(args)) return false;
   const cmd = canonicalizeCommand(command);
   return TUNNEL_COMMANDS.has(cmd);
 }
@@ -189,10 +391,103 @@ async function closeTunnel(): Promise<void> {
   tunnelActive = false;
 }
 
-function validateAuth(req: Request): boolean {
-  const header = req.headers.get('authorization');
-  return header === `Bearer ${AUTH_TOKEN}`;
+/**
+ * Result of startTunnel(). `stage` tells the caller which half failed so it
+ * can keep its distinct error surface: 'bind' = the tunnel-surface Bun.serve
+ * listener could not bind (nothing to clean up), 'ngrok' = anything after the
+ * bind (ngrok forward, egress receipt, state-file write) — startTunnel has
+ * already torn down both ngrok and the Bun listener by the time it returns.
+ */
+type StartTunnelResult =
+  | { ok: true; url: string }
+  | { ok: false; stage: 'bind' | 'ngrok'; error: Error };
+
+/**
+ * Start the ngrok tunnel using the dual-listener pattern: bind a dedicated
+ * tunnel-surface listener on an ephemeral 127.0.0.1 port and point
+ * ngrok.forward() at THAT port — the local listener (which serves
+ * /extension-token, /cookie-picker, /inspector/*, welcome, etc.) is never
+ * exposed to ngrok. Shared by the /tunnel/start route handler (which passes
+ * its in-closure makeFetchHandler('tunnel')) and the BROWSE_TUNNEL=1
+ * auto-start flow in start() (which passes handle.fetchTunnel from the
+ * factory). The BROWSE_TUNNEL_LOCAL_ONLY=1 test path does NOT use this
+ * helper — it binds the tunnel surface with no ngrok forwarding at all.
+ *
+ * Hard fail on listener bind (`stage: 'bind'`) — NEVER fall back to the
+ * local port, which would silently defeat the whole security property.
+ *
+ * On success, sets the module tunnel state (tunnelListener / tunnelUrl /
+ * tunnelServer / tunnelActive) and records the tunnel in the state file.
+ */
+async function startTunnel(opts: {
+  fetchHandler: (req: Request, server: any) => Promise<Response>;
+  authtoken: string;
+  consent: string;
+}): Promise<StartTunnelResult> {
+  // Bind the tunnel listener on an ephemeral port.  HARD FAIL if this
+  // errors — never fall back to the local port.
+  let boundTunnel: ReturnType<typeof Bun.serve>;
+  try {
+    boundTunnel = Bun.serve({
+      port: 0,
+      hostname: '127.0.0.1',
+      fetch: opts.fetchHandler,
+    });
+  } catch (err: any) {
+    return { ok: false, stage: 'bind', error: err };
+  }
+  const tunnelPort = boundTunnel.port;
+
+  // Point ngrok at the TUNNEL port (not the local port).  If this fails,
+  // tear the listener back down so we don't leak sockets.
+  try {
+    const ngrok = await import('@ngrok/ngrok');
+    const domain = process.env.NGROK_DOMAIN;
+    const forwardOpts: any = { addr: tunnelPort, authtoken: opts.authtoken };
+    if (domain) forwardOpts.domain = domain;
+
+    // Egress receipt BEFORE the tunnel session opens, fail-closed: a
+    // writeReceipt failure lands in this catch, which tears the tunnel
+    // listener back down and refuses the start. One receipt per session
+    // open; browse command behavior over the tunnel is unchanged.
+    writeReceipt({
+      sink: 'browse-tunnel',
+      host: domain || 'connect.ngrok-agent.com',
+      payloadClass: 'tunnel-session-open (scoped-token browser-command surface)',
+      bytes: 0,
+      sha256: null,
+      consent: opts.consent,
+    });
+
+    tunnelListener = await ngrok.forward(forwardOpts);
+    tunnelUrl = tunnelListener.url();
+    tunnelServer = boundTunnel;
+    tunnelActive = true;
+    console.log(`[browse] Tunnel listener bound on 127.0.0.1:${tunnelPort}, ngrok → ${tunnelUrl}`);
+
+    // Update state file
+    const stateContent = JSON.parse(fs.readFileSync(config.stateFile, 'utf-8'));
+    stateContent.tunnel = { url: tunnelUrl, domain: domain || null, startedAt: new Date().toISOString() };
+    const tmpState = tmpStatePath();
+    fs.writeFileSync(tmpState, JSON.stringify(stateContent, null, 2), { mode: 0o600 });
+    fs.renameSync(tmpState, config.stateFile);
+
+    return { ok: true, url: tunnelUrl! };
+  } catch (err: any) {
+    // Clean up BOTH ngrok and the Bun listener on failure.  If
+    // ngrok.forward() succeeded but tunnelListener.url() or the
+    // state-file write threw, we'd otherwise leak an active ngrok
+    // session on the user's account.
+    try { if (tunnelListener) await tunnelListener.close(); } catch {}
+    try { boundTunnel.stop(true); } catch {}
+    tunnelListener = null;
+    return { ok: false, stage: 'ngrok', error: err };
+  }
 }
+
+// Module-level validateAuth deleted in v1.35.0.0. Factory-scoped equivalent
+// in buildFetchHandler closes over cfg.authToken so every internal auth check
+// sees the same token the routes receive.
 
 /**
  * Terminal-agent discovery. The non-compiled bun process at
@@ -218,11 +513,13 @@ function readTerminalInternalToken(): string | null {
 
 /**
  * Push a freshly-minted PTY cookie token to the terminal-agent so its
- * /ws upgrade can validate the cookie. Loopback POST authenticated with
- * the internal token written by the agent at startup. Fire-and-forget;
- * if the agent isn't up yet, the extension just retries /pty-session.
+ * /ws upgrade can validate the cookie. v1.44+: also pushes the bound
+ * sessionId so the agent can route /internal/restart and (Commit 3)
+ * re-attach back to the same PtySession. Loopback POST authenticated
+ * with the internal token written by the agent at startup. If the agent
+ * isn't up yet, the extension just retries /pty-session.
  */
-async function grantPtyToken(token: string): Promise<boolean> {
+async function grantPtyToken(token: string, sessionId?: string): Promise<boolean> {
   const port = readTerminalPort();
   const internal = readTerminalInternalToken();
   if (!port || !internal) return false;
@@ -233,8 +530,31 @@ async function grantPtyToken(token: string): Promise<boolean> {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${internal}`,
       },
-      body: JSON.stringify({ token }),
+      body: JSON.stringify(sessionId ? { token, sessionId } : { token }),
       signal: AbortSignal.timeout(2000),
+    });
+    return resp.ok;
+  } catch { return false; }
+}
+
+/**
+ * Ask the terminal-agent to dispose the PtySession bound to `sessionId`.
+ * Scoped to one caller's session — sibling tabs/agents untouched. Used by
+ * /pty-restart and /pty-dispose. Returns true on agent ack.
+ */
+async function restartPtySession(sessionId: string): Promise<boolean> {
+  const port = readTerminalPort();
+  const internal = readTerminalInternalToken();
+  if (!port || !internal) return false;
+  try {
+    const resp = await fetch(`http://127.0.0.1:${port}/internal/restart`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${internal}`,
+      },
+      body: JSON.stringify({ sessionId }),
+      signal: AbortSignal.timeout(5000),
     });
     return resp.ok;
   } catch { return false; }
@@ -259,10 +579,6 @@ function isRootRequest(req: Request): boolean {
   const token = extractToken(req);
   return token !== null && isRootToken(token);
 }
-
-// Sidebar model router was here (sonnet vs opus by message intent). Ripped
-// alongside the chat queue; the interactive PTY just runs whatever model
-// the user's `claude` CLI is configured with.
 
 // ─── Help text (auto-generated from COMMAND_DESCRIPTIONS) ────────
 function generateHelpText(): string {
@@ -313,17 +629,30 @@ const CONSOLE_LOG_PATH = config.consoleLog;
 const NETWORK_LOG_PATH = config.networkLog;
 const DIALOG_LOG_PATH = config.dialogLog;
 
+/**
+ * Per-process state-file temp path. The state-file write pattern is
+ * `writeFileSync(tmp, ...) → renameSync(tmp, stateFile)` for atomicity,
+ * but a shared `${stateFile}.tmp` filename means two concurrent writers
+ * (cold-start race when N CLIs hit a fresh repo simultaneously, parallel
+ * /tunnel/start handlers, or a combination) collide on the rename: the
+ * first writer's renameSync moves the shared temp file out of the way,
+ * the second writer's writeFileSync re-creates it, the second rename
+ * then races with the first writer's already-renamed state. Worst case
+ * the second renameSync throws ENOENT mid-air, killing one of the
+ * spawning daemons during startup.
+ *
+ * Per-process suffix (pid + 4 random bytes) makes each writer's temp
+ * path unique. The atomic rename still gives last-writer-wins semantics
+ * for the final state.json content; the only behavior change is that
+ * concurrent writers no longer kill each other on the rename.
+ */
+function tmpStatePath(): string {
+  return `${config.stateFile}.tmp.${process.pid}.${crypto.randomBytes(4).toString('hex')}`;
+}
+
 
 // ─── Sidebar agent / chat state ripped ──────────────────────────────
-// ChatEntry, SidebarSession, TabAgentState interfaces; chatBuffer,
-// chatBuffers, sidebarSession, agentProcess, agentStatus, agentStartTime,
-// agentTabId, messageQueue, currentMessage, tabAgents; addChatEntry,
-// loadSession, createSession, persistSession, processAgentEvent,
-// killAgent, listSessions, getTabAgent, getTabAgentStatus, and the
-// agentHealthInterval all lived here. Replaced by the live PTY in
-// terminal-agent.ts; chat queue + per-tab agent multiplexing are no
-// longer needed.
-
+let lastConsoleFlushed = 0;
 let lastNetworkFlushed = 0;
 let lastDialogFlushed = 0;
 let flushInProgress = false;
@@ -340,7 +669,7 @@ async function flushBuffers() {
       const lines = entries.map(e =>
         `[${new Date(e.timestamp).toISOString()}] [${e.level}] ${e.text}`
       ).join('\n') + '\n';
-      fs.appendFileSync(CONSOLE_LOG_PATH, lines);
+      appendSecureFile(CONSOLE_LOG_PATH, lines);
       lastConsoleFlushed = consoleBuffer.totalAdded;
     }
 
@@ -351,7 +680,7 @@ async function flushBuffers() {
       const lines = entries.map(e =>
         `[${new Date(e.timestamp).toISOString()}] ${e.method} ${e.url} → ${e.status || 'pending'} (${e.duration || '?'}ms, ${e.size || '?'}B)`
       ).join('\n') + '\n';
-      fs.appendFileSync(NETWORK_LOG_PATH, lines);
+      appendSecureFile(NETWORK_LOG_PATH, lines);
       lastNetworkFlushed = networkBuffer.totalAdded;
     }
 
@@ -362,7 +691,7 @@ async function flushBuffers() {
       const lines = entries.map(e =>
         `[${new Date(e.timestamp).toISOString()}] [${e.type}] "${e.message}" → ${e.action}${e.response ? ` "${e.response}"` : ''}`
       ).join('\n') + '\n';
-      fs.appendFileSync(DIALOG_LOG_PATH, lines);
+      appendSecureFile(DIALOG_LOG_PATH, lines);
       lastDialogFlushed = dialogBuffer.totalAdded;
     }
   } catch (err: any) {
@@ -382,17 +711,47 @@ function resetIdleTimer() {
   lastActivity = Date.now();
 }
 
-const idleCheckInterval = setInterval(() => {
+// Named for behavioral testing via __testInternals__. The factory tests in
+// server-factory.test.ts call this directly so the idle-shutdown path can be
+// exercised without waiting 60s for the interval to fire.
+function idleCheckTick() {
   // Headed mode: the user is looking at the browser. Never auto-die.
   // Only shut down when the user explicitly disconnects or closes the window.
-  if (browserManager.getConnectionMode() === 'headed') return;
+  // Reads via the activeBrowserManager indirection so embedders that pass
+  // their own BrowserManager into buildFetchHandler hit the right instance.
+  if (activeBrowserManager.getConnectionMode() === 'headed') return;
   // Tunnel mode: remote agents may send commands sporadically. Never auto-die.
   if (tunnelActive) return;
   if (Date.now() - lastActivity > IDLE_TIMEOUT_MS) {
     console.log(`[browse] Idle for ${IDLE_TIMEOUT_MS / 1000}s, shutting down`);
-    shutdown();
+    activeShutdown?.();
   }
-}, 60_000);
+}
+const idleCheckInterval = setInterval(idleCheckTick, 60_000);
+
+// Test-only surface for server-factory.test.ts. Lets the dual-instance
+// idle-timer behavior be exercised deterministically without mutating
+// Date.now (which would interact with the leaked module-level setInterval).
+// Production code must never import this — see `idle timer + onDisconnect
+// dual-instance fix` describe block for usage.
+export const __testInternals__ = {
+  idleCheckTick,
+  // Watchdog seams (watchdog.test.ts): drive the 15s poll against an
+  // arbitrary (dead) PID, trigger the handoff-promotion suppression exactly
+  // as onHeadedPromotion does, and reset the latches between tests.
+  parentWatchdogTick,
+  suppressHeadedParentShutdown,
+  resetParentWatchdogState: () => { headedParentShutdownSuppressed = false; parentGone = false; },
+  setTunnelActive: (v: boolean) => { tunnelActive = v; },
+  setLastActivity: (t: number) => { lastActivity = t; },
+  formatExplicitPortUnavailableError,
+  formatRandomPortUnavailableError,
+  // Reset the module-level shutdown latch so tests that drive shutdown to
+  // completion (process.exit-stubbed) can be followed by tests that also
+  // need shutdown to fire. Without this, the second test's shutdown
+  // returns early at the `if (isShuttingDown) return;` guard.
+  resetShutdownState: () => { isShuttingDown = false; },
+};
 
 // ─── Parent-Process Watchdog ────────────────────────────────────────
 // When the spawning CLI process (e.g. a Claude Code session) exits, this
@@ -412,43 +771,99 @@ const BROWSE_PARENT_PID = parseInt(process.env.BROWSE_PARENT_PID || '0', 10);
 // the closure every 15s. The CLI's connect path sets BROWSE_HEADED=1 + PID=0,
 // so this branch is the normal path for /open-gstack-browser.
 const IS_HEADED_WATCHDOG = process.env.BROWSE_HEADED === '1';
-if (BROWSE_PARENT_PID > 0 && !IS_HEADED_WATCHDOG) {
-  let parentGone = false;
-  setInterval(() => {
-    try {
-      process.kill(BROWSE_PARENT_PID, 0); // signal 0 = existence check only, no signal sent
-    } catch {
-      // Parent exited. Resolution order:
-      // 1. Active cookie picker (one-time code or session live)? Stay alive
-      //    regardless of mode — tearing down the server mid-import leaves the
-      //    picker UI with a stale "Failed to fetch" error.
-      // 2. Headed / tunnel mode? Shutdown. The idle timeout doesn't apply in
-      //    these modes (see idleCheckInterval above — both early-return), so
-      //    ignoring parent death here would leak orphan daemons after
-      //    /pair-agent or /open-gstack-browser sessions.
-      // 3. Normal (headless) mode? Stay alive. Claude Code's Bash tool kills
-      //    the parent shell between invocations. The idle timeout (30 min)
-      //    handles eventual cleanup.
-      if (hasActivePicker()) return;
-      const headed = browserManager.getConnectionMode() === 'headed';
-      if (headed || tunnelActive) {
-        console.log(`[browse] Parent process ${BROWSE_PARENT_PID} exited in ${headed ? 'headed' : 'tunnel'} mode, shutting down`);
-        shutdown();
-      } else if (!parentGone) {
-        parentGone = true;
-        console.log(`[browse] Parent process ${BROWSE_PARENT_PID} exited (server stays alive, idle timeout will clean up)`);
-      }
+// Runtime promotion to headed (`handoff`) must NOT clear this interval — the
+// same tick is the tunnel-orphan reaper, and idle timeout is disabled in
+// tunnel mode, so parent death is the ONLY thing that reaps an
+// internet-exposed daemon after handoff → resume → /pair-agent. Promotion
+// sets this suppress flag instead; the tick re-reads it (and tunnelActive)
+// every pass. See suppressHeadedParentShutdown() below.
+let headedParentShutdownSuppressed = false;
+// Latch for the one-time "parent exited, staying alive" log line.
+let parentGone = false;
+// Named + parameterized (default: the boot-time env PID) so watchdog.test.ts
+// can drive the tick deterministically via __testInternals__, mirroring
+// idleCheckTick above. setInterval invokes it with no args in production.
+function parentWatchdogTick(parentPid: number = BROWSE_PARENT_PID): void {
+  try {
+    process.kill(parentPid, 0); // signal 0 = existence check only, no signal sent
+  } catch {
+    // Parent exited. Resolution order:
+    // 1. Active cookie picker (one-time code or session live)? Stay alive
+    //    regardless of mode — tearing down the server mid-import leaves the
+    //    picker UI with a stale "Failed to fetch" error.
+    // 2. Headed (unless suppressed by a runtime promotion) / tunnel mode?
+    //    Shutdown. The idle timeout doesn't apply in these modes (see
+    //    idleCheckInterval above — both early-return), so ignoring parent
+    //    death here would leak orphan daemons after /pair-agent or
+    //    /open-gstack-browser sessions.
+    // 3. Normal (headless) mode, or headed-by-promotion? Stay alive. Claude
+    //    Code's Bash tool kills the parent shell between invocations, and a
+    //    promoted daemon's user owns the window lifecycle. The idle timeout
+    //    (30 min) handles eventual cleanup.
+    if (hasActivePicker()) return;
+    const headed = activeBrowserManager.getConnectionMode() === 'headed'
+      && !headedParentShutdownSuppressed;
+    if (headed || tunnelActive) {
+      console.log(`[browse] Parent process ${parentPid} exited in ${headed ? 'headed' : 'tunnel'} mode, shutting down`);
+      activeShutdown?.();
+    } else if (!parentGone) {
+      parentGone = true;
+      console.log(`[browse] Parent process ${parentPid} exited (server stays alive, idle timeout will clean up)`);
     }
-  }, 15_000);
+  }
+}
+if (BROWSE_PARENT_PID > 0 && !IS_HEADED_WATCHDOG) {
+  setInterval(parentWatchdogTick, 15_000);
 } else if (IS_HEADED_WATCHDOG) {
   console.log('[browse] Parent-process watchdog disabled (headed mode)');
 } else if (BROWSE_PARENT_PID === 0) {
   console.log('[browse] Parent-process watchdog disabled (BROWSE_PARENT_PID=0)');
 }
 
+/**
+ * Suppress the headed-mode parent-death shutdown after a runtime promotion.
+ *
+ * The watchdog's contract is "headless daemons outlive their parent, headed ones
+ * do not" — reasonable at boot, when mode is fixed by env. `handoff` breaks that
+ * assumption: it swaps in a headed context on a RUNNING daemon
+ * (browser-manager.ts, connectionMode = 'headed') without a restart, so a daemon
+ * that legitimately registered a watchdog is suddenly on the fatal side of the
+ * branch. The parent is typically a short-lived shell — Claude Code's Bash tool
+ * kills one after every invocation — so the next 15s poll shuts the daemon down,
+ * discarding whatever the user was handed off to do, such as a login.
+ *
+ * Once promoted, the user owns the window lifecycle exactly as if the daemon had
+ * been started headed, which is the case the env guards already exempt.
+ *
+ * A flag, NOT clearInterval: the tick doubles as the tunnel-orphan reaper
+ * (its `tunnelActive` branch), and idle timeout is disabled in tunnel mode —
+ * clearing the whole interval here left handoff → resume → /pair-agent with
+ * an internet-exposed daemon nothing could ever reap. After promotion, parent
+ * death no longer kills the daemon for BEING HEADED, but still kills it when
+ * a tunnel is active.
+ */
+function suppressHeadedParentShutdown(): void {
+  if (headedParentShutdownSuppressed) return;
+  headedParentShutdownSuppressed = true;
+  console.log('[browse] Parent-death headed shutdown suppressed (promoted to headed at runtime); watchdog stays armed as the tunnel-orphan reaper');
+}
+
 // ─── Command Sets (from commands.ts — single source of truth) ───
 import { READ_COMMANDS, WRITE_COMMANDS, META_COMMANDS } from './commands';
 export { READ_COMMANDS, WRITE_COMMANDS, META_COMMANDS };
+
+/**
+ * Whether an invocation should be treated as a WRITE for capability gating
+ * (scope, watch-mode block, tab ownership, tunnel). A command is a write if it
+ * mutates state (`WRITE_COMMANDS`) OR it carries an `--out` flag — `js`/`eval
+ * --out` writes the evaluate result to local disk, so the capability is
+ * per-invocation, not per-command-name. This deliberately does NOT change
+ * dispatch routing: `js`/`eval` still route to `handleReadCommand`; only the
+ * security gates consult this.
+ */
+function isWriteInvocation(command: string, args: string[]): boolean {
+  return WRITE_COMMANDS.has(command) || hasOutArg(args);
+}
 
 // ─── Inspector State (in-memory) ──────────────────────────────
 let inspectorData: InspectorResult | null = null;
@@ -457,6 +872,11 @@ let inspectorTimestamp: number = 0;
 // Inspector SSE subscribers
 type InspectorSubscriber = (event: any) => void;
 const inspectorSubscribers = new Set<InspectorSubscriber>();
+
+/** Diagnostic accessor used by the $B memory snapshot. */
+export function getInspectorSubscriberCount(): number {
+  return inspectorSubscribers.size;
+}
 
 function emitInspectorEvent(event: any): void {
   for (const notify of inspectorSubscribers) {
@@ -470,47 +890,43 @@ function emitInspectorEvent(event: any): void {
 
 // ─── Server ────────────────────────────────────────────────────
 const browserManager = new BrowserManager();
+// Declared here rather than beside suppressHeadedParentShutdown: that function
+// sits with the watchdog it gates, which is above this line, and binding it up
+// there would touch `browserManager` in its temporal dead zone — aborting
+// module evaluation and leaving every later const uninitialized.
+browserManager.onHeadedPromotion = suppressHeadedParentShutdown;
+// Indirection for embedders. Module-level handlers (idleCheckTick, parent
+// watchdog, SIGTERM) read activeBrowserManager so that buildFetchHandler can
+// retarget them at a caller-supplied BrowserManager. Symmetric with the
+// existing `let activeShutdown` pattern at module scope (line ~113).
+// Without this, embedders like gbrowser hit the dead module-level instance
+// whose connectionMode never leaves 'launched' — and headed mode never
+// short-circuits idle-shutdown.
+let activeBrowserManager: BrowserManager = browserManager;
 // When the user closes the headed browser window, run full cleanup
-// (kill sidebar-agent, save session, remove profile locks, delete state file)
-// before exiting with code 2. Exit code 2 distinguishes user-close from crashes (1).
-browserManager.onDisconnect = () => shutdown(2);
+// (kill terminal agent, save session, remove profile locks, delete state file)
+// before exiting. Exit code 0 means user-initiated clean quit (Cmd+Q on
+// macOS) so process supervisors like gbrowser's gbd skip the restart loop;
+// 2 means a real crash that should respawn. The fallback `?? 2` preserves
+// legacy crash semantics for any caller that invokes onDisconnect without
+// an explicit code. This is the safety-net default for the CLI flow before
+// any buildFetchHandler call rebinds onDisconnect onto the cfg instance.
+browserManager.onDisconnect = (code) => activeShutdown?.(code ?? 2);
 let isShuttingDown = false;
+// Session-persist ticker handle. Registered in start() (module scope so the
+// factory's shutdown() can reach it), cleared by shutdown() BEFORE the final
+// snapshot — a tick landing during browser teardown would otherwise overwrite
+// the good final snapshot with a degraded one (zero tabs).
+let sessionPersistInterval: ReturnType<typeof setInterval> | null = null;
 
-// Test if a port is available by binding and immediately releasing.
-// Uses net.createServer instead of Bun.serve to avoid a race condition
-// in the Node.js polyfill where listen/close are async but the caller
-// expects synchronous bind semantics. See: #486
-function isPortAvailable(port: number, hostname: string = '127.0.0.1'): Promise<boolean> {
-  return new Promise((resolve) => {
-    const srv = net.createServer();
-    srv.once('error', () => resolve(false));
-    srv.listen(port, hostname, () => {
-      srv.close(() => resolve(true));
-    });
-  });
-}
+// Port allocation lives in port-allocator.ts (#2314, decision 8) so the
+// terminal-agent shares the SAME fixed 10000-60000 scan range instead of
+// binding port:0 into the OS ephemeral range. The imports at the top of
+// this file re-expose the pieces __testInternals__ pins.
 
 // Find port: explicit BROWSE_PORT, or random in 10000-60000
-async function findPort(): Promise<number> {
-  // Explicit port override (for debugging)
-  if (BROWSE_PORT) {
-    if (await isPortAvailable(BROWSE_PORT)) {
-      return BROWSE_PORT;
-    }
-    throw new Error(`[browse] Port ${BROWSE_PORT} (from BROWSE_PORT env) is in use`);
-  }
-
-  // Random port with retry
-  const MIN_PORT = 10000;
-  const MAX_PORT = 60000;
-  const MAX_RETRIES = 5;
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    const port = MIN_PORT + Math.floor(Math.random() * (MAX_PORT - MIN_PORT));
-    if (await isPortAvailable(port)) {
-      return port;
-    }
-  }
-  throw new Error(`[browse] No available port after ${MAX_RETRIES} attempts in range ${MIN_PORT}-${MAX_PORT}`);
+function findPort(): Promise<number> {
+  return findAvailablePort(BROWSE_PORT);
 }
 
 /**
@@ -553,7 +969,7 @@ interface CommandResult {
  *   skipActivity: true when called from chain (chain emits 1 event for all subcommands)
  *   chainDepth: recursion guard — reject nested chains (depth > 0 means inside a chain)
  */
-async function handleCommandInternal(
+async function handleCommandInternalImpl(
   body: { command: string; args?: string[]; tabId?: number },
   tokenInfo?: TokenInfo | null,
   opts?: { skipRateCheck?: boolean; skipActivity?: boolean; chainDepth?: number },
@@ -585,7 +1001,20 @@ async function handleCommandInternal(
         status: 403, json: true,
         result: JSON.stringify({
           error: `Command "${command}" not allowed by your token scope`,
-          hint: `Your scopes: ${tokenInfo.scopes.join(', ')}. Ask the user to re-pair with --admin for eval/cookies/storage access.`,
+          hint: `Your scopes: ${tokenInfo.scopes.join(', ')}. Ask the user to re-pair without --restrict for full page access, or with --control for browser control commands.`,
+        }),
+      };
+    }
+
+    // `--out` writes the evaluate result to local disk, which is a WRITE
+    // capability distinct from the JS-exec (admin) capability js/eval need.
+    // Require write scope so an admin-but-not-write token can't write files.
+    if (hasOutArg(args) && !tokenInfo.scopes.includes('write')) {
+      return {
+        status: 403, json: true,
+        result: JSON.stringify({
+          error: `"--out" writes to disk and requires the "write" scope`,
+          hint: `Your scopes: ${tokenInfo.scopes.join(', ')}. Re-pair with write access to use --out.`,
         }),
       };
     }
@@ -622,7 +1051,7 @@ async function handleCommandInternal(
     if (!opts?.skipRateCheck && tokenInfo.token) recordCommand(tokenInfo.token);
   }
 
-  // Pin to a specific tab if requested (set by BROWSE_TAB env var in sidebar agents).
+  // Pin to a specific tab if requested (set by BROWSE_TAB env var, e.g. per-tab agent contexts).
   // This prevents parallel agents from interfering with each other's tab context.
   // Safe because Bun's event loop is single-threaded — no concurrent handleCommand.
   let savedTabId: number | null = null;
@@ -644,7 +1073,7 @@ async function handleCommandInternal(
   // Skip for `newtab` — it creates a tab rather than accessing one.
   if (command !== 'newtab' && tokenInfo && tokenInfo.clientId !== 'root' && tokenInfo.tabPolicy === 'own-only') {
     const targetTab = tabId ?? browserManager.getActiveTabId();
-    if (!browserManager.checkTabAccess(targetTab, tokenInfo.clientId, { isWrite: WRITE_COMMANDS.has(command), ownOnly: true })) {
+    if (!browserManager.checkTabAccess(targetTab, tokenInfo.clientId, { isWrite: isWriteInvocation(command, args), ownOnly: true })) {
       return {
         status: 403, json: true,
         result: JSON.stringify({
@@ -668,8 +1097,9 @@ async function handleCommandInternal(
     };
   }
 
-  // Block mutation commands while watching (read-only observation mode)
-  if (browserManager.isWatching() && WRITE_COMMANDS.has(command)) {
+  // Block mutation commands while watching (read-only observation mode).
+  // `--out` invocations count as mutations (they write the result to disk).
+  if (browserManager.isWatching() && isWriteInvocation(command, args)) {
     return {
       status: 400, json: true,
       result: JSON.stringify({ error: 'Cannot run mutation commands while watching. Run `$B watch stop` first.' }),
@@ -740,7 +1170,10 @@ async function handleCommandInternal(
       // Pass chain depth + executeCommand callback so chain routes subcommands
       // through the full security pipeline (scope, domain, tab, wrapping).
       const chainDepth = (opts?.chainDepth ?? 0);
-      result = await handleMetaCommand(command, args, browserManager, shutdown, tokenInfo, {
+      // shutdown is factory-scoped (deleted from module scope in v1.35.0.0);
+      // route the call through activeShutdown which buildFetchHandler assigns.
+      const shutdownFn = () => activeShutdown ? activeShutdown() : Promise.resolve();
+      result = await handleMetaCommand(command, args, browserManager, shutdownFn, tokenInfo, {
         chainDepth,
         daemonPort: LOCAL_LISTEN_PORT,
         executeCommand: (body, ti) => handleCommandInternal(body, ti, {
@@ -897,154 +1330,427 @@ async function handleCommandInternal(
   }
 }
 
-/** HTTP wrapper — converts CommandResult to Response */
-async function handleCommand(body: any, tokenInfo?: TokenInfo | null): Promise<Response> {
-  const cr = await handleCommandInternal(body, tokenInfo);
+/**
+ * Sanitizing wrapper around handleCommandInternalImpl. ALL callers (single-command
+ * HTTP, batch loop, scoped-token dispatch) go through this so the lone-surrogate
+ * sanitization happens once at the architectural choke point, not per-leaf.
+ * Do not bypass this by calling handleCommandInternalImpl directly.
+ */
+async function handleCommandInternal(
+  body: { command: string; args?: string[]; tabId?: number },
+  tokenInfo?: TokenInfo | null,
+  opts?: { skipRateCheck?: boolean; skipActivity?: boolean; chainDepth?: number },
+): Promise<CommandResult> {
+  const cr = await handleCommandInternalImpl(body, tokenInfo, opts);
+  return { ...cr, result: stripLoneSurrogates(cr.result) };
+}
+
+/**
+ * Build the HTTP response from a CommandResult. Pure function so it can be
+ * unit-tested without spinning up the server (#1440). Defense in depth on top
+ * of handleCommandInternal's choke-point sanitization: this catches any
+ * \uXXXX JSON-escape surrogate forms that the raw-codepoint regex above
+ * misses when the body has already been JSON-stringified.
+ */
+export function buildCommandResponse(cr: CommandResult): Response {
   const contentType = cr.json ? 'application/json' : 'text/plain';
-  return new Response(cr.result, {
+  const safeBody = typeof cr.result === 'string' ? sanitizeBody(cr.result, !!cr.json) : cr.result;
+  return new Response(safeBody, {
     status: cr.status,
     headers: { 'Content-Type': contentType, ...cr.headers },
   });
 }
 
-async function shutdown(exitCode: number = 0) {
-  if (isShuttingDown) return;
-  isShuttingDown = true;
-
-  console.log('[browse] Shutting down...');
-  // Kill the terminal-agent daemon (spawned by cli.ts, detached). Without
-  // this, the agent keeps sitting on its WebSocket port.
-  try {
-    const { spawnSync } = require('child_process');
-    spawnSync('pkill', ['-f', 'terminal-agent\\.ts'], { stdio: 'ignore', timeout: 3000 });
-  } catch (err: any) {
-    console.warn('[browse] Failed to kill terminal-agent:', err.message);
-  }
-  // Best-effort cleanup of agent state files so a reconnect doesn't try to
-  // hit a dead port.
-  try { safeUnlinkQuiet(path.join(path.dirname(config.stateFile), 'terminal-port')); } catch {}
-  try { safeUnlinkQuiet(path.join(path.dirname(config.stateFile), 'terminal-internal-token')); } catch {}
-  // Clean up CDP inspector sessions
-  try { detachSession(); } catch (err: any) {
-    console.warn('[browse] Failed to detach CDP session:', err.message);
-  }
-  inspectorSubscribers.clear();
-  // Stop watch mode if active
-  if (browserManager.isWatching()) browserManager.stopWatch();
-  clearInterval(flushInterval);
-  clearInterval(idleCheckInterval);
-  await flushBuffers(); // Final flush (async now)
-
-  await browserManager.close();
-
-  // Clean up Chromium profile locks (prevent SingletonLock on next launch)
-  const profileDir = path.join(process.env.HOME || '/tmp', '.gstack', 'chromium-profile');
-  for (const lockFile of ['SingletonLock', 'SingletonSocket', 'SingletonCookie']) {
-    safeUnlinkQuiet(path.join(profileDir, lockFile));
-  }
-
-  // Clean up state file
-  safeUnlinkQuiet(config.stateFile);
-
-  process.exit(exitCode);
+/** HTTP wrapper — converts CommandResult to Response. Used by the /command
+ * route dispatcher (line ~2158). The wrapper layer exists so
+ * `buildCommandResponse` is independently unit-testable (v1.38.1.0).
+ */
+async function handleCommand(body: any, tokenInfo?: TokenInfo | null): Promise<Response> {
+  const cr = await handleCommandInternal(body, tokenInfo);
+  return buildCommandResponse(cr);
 }
+
+// Module-level shutdown function deleted in v1.39.0.0; it now lives inside
+// the buildFetchHandler closure so it closes the cfg-provided browserManager.
+// Signal handlers below call activeShutdown which buildFetchHandler assigns.
 
 // Handle signals
 //
 // Node passes the signal name (e.g. 'SIGTERM') as the first arg to listeners.
-// Wrap calls to shutdown() so it receives no args — otherwise the string gets
+// Wrap calls so activeShutdown receives no args — otherwise the string gets
 // passed as exitCode and process.exit() coerces it to NaN, exiting with code 1
 // instead of 0. (Caught in v0.18.1.0 #1025.)
 //
-// SIGINT (Ctrl+C): user intentionally stopping → shutdown.
-process.on('SIGINT', () => shutdown());
-// SIGTERM behavior depends on mode:
-// - Normal (headless) mode: Claude Code's Bash sandbox fires SIGTERM when the
-//   parent shell exits between tool invocations. Ignoring it keeps the server
-//   alive across $B calls. Idle timeout (30 min) handles eventual cleanup.
-// - Headed / tunnel mode: idle timeout doesn't apply in these modes. Respect
-//   SIGTERM so external tooling (systemd, supervisord, CI) can shut cleanly
-//   without waiting forever. Ctrl+C and /stop still work either way.
-// - Active cookie picker: never tear down mid-import regardless of mode —
-//   would strand the picker UI with "Failed to fetch."
-process.on('SIGTERM', () => {
-  if (hasActivePicker()) {
-    console.log('[browse] Received SIGTERM but cookie picker is active, ignoring to avoid stranding the picker UI');
-    return;
-  }
-  const headed = browserManager.getConnectionMode() === 'headed';
-  if (headed || tunnelActive) {
-    console.log(`[browse] Received SIGTERM in ${headed ? 'headed' : 'tunnel'} mode, shutting down`);
-    shutdown();
-  } else {
-    console.log('[browse] Received SIGTERM (ignoring — use /stop or Ctrl+C for intentional shutdown)');
-  }
-});
-// Windows: taskkill /F bypasses SIGTERM, but 'exit' fires for some shutdown paths.
-// Defense-in-depth — primary cleanup is the CLI's stale-state detection via health check.
-if (process.platform === 'win32') {
-  process.on('exit', () => {
-    safeUnlinkQuiet(config.stateFile);
+// Gated on `import.meta.main` so embedders (gbrowser phoenix) that import
+// server.ts as a submodule can register their own signal handlers without
+// fighting with gstack's. CLI path is unchanged.
+if (import.meta.main) {
+  // SIGINT (Ctrl+C): user intentionally stopping → shutdown.
+  process.on('SIGINT', () => activeShutdown?.());
+  // SIGHUP (terminal hangup): with handleSIGHUP:false at the three launch
+  // sites (#2220), Playwright no longer closes Chromium when this process
+  // gets hung up on — this handler is now the ONLY Chromium cleanup on
+  // SIGHUP (ENG-OV4). Route to the same shutdown path as SIGINT:
+  // activeShutdown closes the browser, releases ports, and removes the
+  // state file. Without it, a hangup would leak a live Chromium.
+  process.on('SIGHUP', () => activeShutdown?.());
+  // SIGTERM behavior depends on mode:
+  // - Normal (headless) mode: Claude Code's Bash sandbox fires SIGTERM when the
+  //   parent shell exits between tool invocations. Ignoring it keeps the server
+  //   alive across $B calls. Idle timeout (30 min) handles eventual cleanup.
+  // - Headed / tunnel mode: idle timeout doesn't apply in these modes. Respect
+  //   SIGTERM so external tooling (systemd, supervisord, CI) can shut cleanly
+  //   without waiting forever. Ctrl+C and /stop still work either way.
+  // - Active cookie picker: never tear down mid-import regardless of mode —
+  //   would strand the picker UI with "Failed to fetch."
+  process.on('SIGTERM', () => {
+    if (hasActivePicker()) {
+      console.log('[browse] Received SIGTERM but cookie picker is active, ignoring to avoid stranding the picker UI');
+      return;
+    }
+    const headed = activeBrowserManager.getConnectionMode() === 'headed';
+    if (headed || tunnelActive) {
+      console.log(`[browse] Received SIGTERM in ${headed ? 'headed' : 'tunnel'} mode, shutting down`);
+      activeShutdown?.();
+    } else {
+      console.log('[browse] Received SIGTERM (ignoring — use /stop or Ctrl+C for intentional shutdown)');
+    }
   });
+  // Windows: taskkill /F bypasses SIGTERM, but 'exit' fires for some shutdown paths.
+  // Defense-in-depth — primary cleanup is the CLI's stale-state detection via health check.
+  if (process.platform === 'win32') {
+    process.on('exit', () => {
+      safeUnlinkQuiet(config.stateFile);
+    });
+  }
 }
 
 // Emergency cleanup for crashes (OOM, uncaught exceptions, browser disconnect)
 function emergencyCleanup() {
   if (isShuttingDown) return;
   isShuttingDown = true;
-  // Clean Chromium profile locks
-  const profileDir = path.join(process.env.HOME || '/tmp', '.gstack', 'chromium-profile');
-  for (const lockFile of ['SingletonLock', 'SingletonSocket', 'SingletonCookie']) {
-    safeUnlinkQuiet(path.join(profileDir, lockFile));
-  }
+  // Xvfb cleanup MUST happen before state-file deletion. spawnXvfb detaches
+  // the child, so without this, an uncaught exception leaves the Xvfb
+  // running with no PID record — orphan accumulates and eventually
+  // exhausts the :99-:120 display range. Read the state file FIRST,
+  // call cleanupXvfb (validates cmdline + start-time before kill), THEN
+  // delete the state file.
+  try {
+    if (fs.existsSync(config.stateFile)) {
+      const raw = fs.readFileSync(config.stateFile, 'utf-8');
+      const state = JSON.parse(raw);
+      if (state.xvfbPid && state.xvfbStartTime) {
+        // Lazy import — emergencyCleanup may run on platforms where
+        // ./xvfb's Linux-specific helpers fail to load. Best effort.
+        try {
+          const { cleanupXvfb } = require('./xvfb');
+          cleanupXvfb({
+            pid: state.xvfbPid,
+            startTime: state.xvfbStartTime,
+            display: state.xvfbDisplay || ':99',
+          });
+        } catch { /* best effort */ }
+      }
+    }
+  } catch { /* state file unparseable — fall through to lock + state cleanup */ }
+
+  // Clean Chromium profile locks via the shared helper (defensive guard
+  // refuses to operate on unrecognized profile dirs).
+  cleanSingletonLocks(resolveChromiumProfile());
   safeUnlinkQuiet(config.stateFile);
 }
-process.on('uncaughtException', (err) => {
-  console.error('[browse] FATAL uncaught exception:', err.message);
-  emergencyCleanup();
-  process.exit(1);
-});
-process.on('unhandledRejection', (err: any) => {
-  console.error('[browse] FATAL unhandled rejection:', err?.message || err);
-  emergencyCleanup();
-  process.exit(1);
-});
+// Same import.meta.main gate as SIGINT/SIGTERM — embedders register their
+// own crash handlers.
+if (import.meta.main) {
+  process.on('uncaughtException', (err) => {
+    console.error('[browse] FATAL uncaught exception:', err.message);
+    emergencyCleanup();
+    process.exit(1);
+  });
+  process.on('unhandledRejection', (err: any) => {
+    console.error('[browse] FATAL unhandled rejection:', err?.message || err);
+    emergencyCleanup();
+    process.exit(1);
+  });
+}
 
 // ─── Start ─────────────────────────────────────────────────────
-async function start() {
-  // Clear old log files
-  safeUnlink(CONSOLE_LOG_PATH);
-  safeUnlink(NETWORK_LOG_PATH);
-  safeUnlink(DIALOG_LOG_PATH);
-
-  const port = await findPort();
-  LOCAL_LISTEN_PORT = port;
-
-  // Launch browser (headless or headed with extension)
-  // BROWSE_HEADLESS_SKIP=1 skips browser launch entirely (for HTTP-only testing)
-  const skipBrowser = process.env.BROWSE_HEADLESS_SKIP === '1';
-  if (!skipBrowser) {
-    const headed = process.env.BROWSE_HEADED === '1';
-    if (headed) {
-      await browserManager.launchHeaded(AUTH_TOKEN);
-      console.log(`[browse] Launched headed Chromium with extension`);
-    } else {
-      await browserManager.launch();
-    }
+/**
+ * Entry point for `bun run dev` and the compiled binary.
+ *
+ * Exported so embedders (gbrowser phoenix overlay) can call it
+ * directly with env vars set, bypassing the module-level `import.meta.main`
+ * gate. Phoenix's eventual fd-passing path will use `buildFetchHandler`
+ * directly; until that lands, calling `start()` from a non-main entry is
+ * supported via env (AUTH_TOKEN, BROWSE_PORT, BROWSE_OWN_SIGNALS).
+ */
+/**
+ * Build a request handler set for the browse daemon. Embedders (gbrowser
+ * phoenix overlay) call this directly with their own cfg to compose overlay
+ * routes via cfg.beforeRoute, pass a pre-launched cfg.browserManager, and
+ * opt out of terminal-agent teardown via cfg.ownsTerminalAgent (default
+ * true, set to false when the embedder runs its own PTY server). The CLI
+ * path calls this through start() with env-derived defaults and explicit
+ * cfg.ownsTerminalAgent: true — externally-observable behavior is identical.
+ *
+ * Auth state lives ENTIRELY inside the factory closure: cfg.authToken is the
+ * single source of truth for the bearer secret, factory-scoped validateAuth
+ * closes over it, and factory-scoped shutdown closes the cfg-provided
+ * browserManager. Module-level lifecycle singletons (LOCAL_LISTEN_PORT,
+ * tunnelActive, inspector state) intentionally STAY at module scope; see
+ * the v1.35.0.0 CHANGELOG entry for the architectural rationale.
+ *
+ * The returned ServerHandle is callable directly. Bun.serve is the caller's
+ * responsibility — embedders may fd-pass; CLI uses Bun.serve normally.
+ */
+export function buildFetchHandler(cfg: ServerConfig): ServerHandle {
+  if (!cfg.authToken || cfg.authToken.length < 16) {
+    throw new Error('buildFetchHandler: cfg.authToken must be a non-empty string >= 16 chars');
+  }
+  if (!cfg.browserManager) {
+    throw new Error('buildFetchHandler: cfg.browserManager is required');
   }
 
-  const startTime = Date.now();
+  // Re-run init with cfg-provided values. ensureStateDir is idempotent
+  // (mkdir -p); initAuditLog is idempotent (sets a module string);
+  // initRegistry is idempotent for same-token, throws for different-token.
+  // Owning init here (instead of at module load) means cfg.authToken is the
+  // single source of truth for the registry root token.
+  ensureStateDir(cfg.config);
+  initAuditLog(cfg.config.auditLog);
+  initRegistry(cfg.authToken);
 
-  // ─── Request handler factory ────────────────────────────────────
+  const { authToken, browserManager: cfgBrowserManager, startTime, beforeRoute, browsePort } = cfg;
+  // Strict opt-out: only explicit `false` flips the gate. Any other value
+  // (undefined, truthy non-bool from a JS caller bypassing TS, etc.) defaults
+  // to gstack-owns. Matches the "default-true preserves CLI bit-for-bit"
+  // premise even under malformed cfg.
+  const ownsTerminalAgent = cfg.ownsTerminalAgent === false ? false : true;
+
+  // ─── Terminal-Agent Watchdog (v1.44+) ─────────────────────────────
   //
-  // Same logic serves both the local listener (bootstrap, CLI, sidebar) and
-  // the tunnel listener (pairing + scoped-token commands).  The factory
-  // closes over `surface` so the filter that runs before route dispatch
-  // knows which socket accepted the request.
+  // The terminal-agent process can die independently of the server: SIGKILL
+  // from the OS OOM killer, an uncaught exception under load, an external
+  // `pkill` from a sibling debugging session. Pre-v1.44 the sidebar would
+  // see the broken connection and stay broken until the user reloaded.
+  // Now: 60s ticker checks the recorded agent PID, respawns via the shared
+  // spawnTerminalAgent helper if dead.
   //
-  // On the tunnel surface: reject anything not in TUNNEL_PATHS (404), reject
-  // root-token bearers (403), and require a scoped token for everything
-  // except /connect.  Denials are logged to ~/.gstack/security/attempts.jsonl.
+  // Identity-based — uses readAgentRecord + isProcessAlive, NOT a process
+  // name probe. Critical: prevents respawning around a slow-but-alive agent
+  // (which would create split-brain — two agents writing the port file,
+  // tokens diverging between them, mystery PTY upgrade failures).
+  //
+  // Crash-loop guard: 3 respawn attempts inside 60s → stop trying and emit
+  // a one-line error. Manual `forceRestart` from the sidebar clears the
+  // history (the user is the explicit signal to retry).
+  //
+  // Only active when ownsTerminalAgent === true. Embedders that pre-launch
+  // their own PTY server (gbrowser phoenix overlay) must not be auto-respawned
+  // by us — their lifecycle is their concern.
+  let agentWatchdogInterval: ReturnType<typeof setInterval> | null = null;
+  const respawnHistory: number[] = [];
+  const AGENT_WATCHDOG_TICK_MS = parseInt(
+    process.env.GSTACK_AGENT_WATCHDOG_TICK_MS || '60000',
+    10,
+  );
+  const RESPAWN_GUARD_MAX = 3;
+  // The guard window MUST span enough ticks for RESPAWN_GUARD_MAX respawns to
+  // land inside it. This was a fixed 60_000 against a 60_000 tick, so at most
+  // ONE respawn could ever be in the window and `respawnHistory.length >= 3`
+  // was unreachable — the guard could not fire at the default tick rate, and a
+  // steady one-per-tick leak ran unbounded instead of stopping after 3. Scale
+  // with the tick so the intent ("3 crashes in quick succession → stop") holds
+  // at any tick value: 3 respawns within 5 ticks trips it.
+  const RESPAWN_GUARD_WINDOW_MS = Math.max(
+    60_000,
+    AGENT_WATCHDOG_TICK_MS * (RESPAWN_GUARD_MAX + 2),
+  );
+  let agentRespawnGuardTripped = false;
+
+  if (ownsTerminalAgent) {
+    agentWatchdogInterval = setInterval(() => {
+      if (isShuttingDown) return;
+      if (agentRespawnGuardTripped) return;
+      const stateDir = path.dirname(cfg.config.stateFile);
+      const record = readAgentRecord(stateDir);
+      // If the record exists and the PID is alive, the agent is healthy
+      // (or at least still answering signal 0). Slow-but-alive agents
+      // intentionally fall through here — split-brain is worse than
+      // unresponsiveness, and slow recovery is handled by the user via
+      // restart.
+      if (record && isProcessAlive(record.pid)) return;
+      // Either no record (never spawned, or cleaned up after crash) or
+      // PID is dead. Try to respawn.
+      const now = Date.now();
+      while (respawnHistory.length && now - respawnHistory[0] > RESPAWN_GUARD_WINDOW_MS) {
+        respawnHistory.shift();
+      }
+      if (respawnHistory.length >= RESPAWN_GUARD_MAX) {
+        agentRespawnGuardTripped = true;
+        console.error(
+          `[browse] terminal-agent respawn guard tripped (${RESPAWN_GUARD_MAX} crashes in ${RESPAWN_GUARD_WINDOW_MS / 1000}s) — manual restart required`,
+        );
+        return;
+      }
+      respawnHistory.push(now);
+      try {
+        const pid = spawnTerminalAgent({
+          stateFile: cfg.config.stateFile,
+          serverPort: cfg.browsePort,
+          ownerPid: process.pid,
+          cwd: cfg.config.projectDir,
+        });
+        if (pid) {
+          console.log(`[browse] terminal-agent respawned by watchdog (PID: ${pid})`);
+        } else {
+          console.warn('[browse] terminal-agent respawn skipped — script not found on disk');
+        }
+      } catch (err: any) {
+        console.warn('[browse] terminal-agent respawn failed:', err?.message || err);
+      }
+    }, AGENT_WATCHDOG_TICK_MS);
+    // Detach the watchdog timer from Node's event-loop ref count so a
+    // healthy idle process can still exit cleanly if everything else is
+    // also unref'd. Bun's setInterval returns a Timer with unref().
+    (agentWatchdogInterval as any)?.unref?.();
+  }
+
+  // Factory-scoped validateAuth. Closes over cfg.authToken so every internal
+  // auth check sees the same token the routes receive. Module-level
+  // validateAuth was deleted in v1.35.0.0.
+  function validateAuth(req: Request): boolean {
+    const header = req.headers.get('authorization');
+    if (header === null) return false;
+    // Constant-time compare so a byte-by-byte early-exit can't leak the token
+    // prefix via response timing. timingSafeEqual requires equal-length inputs,
+    // so the length check gates it (the length itself is not secret).
+    const got = Buffer.from(header);
+    const want = Buffer.from(`Bearer ${authToken}`);
+    return got.length === want.length && crypto.timingSafeEqual(got, want);
+  }
+
+  // Factory-scoped shutdown. Closes the cfg-provided browserManager so
+  // embedders that pass their own BrowserManager get correct teardown.
+  // Module-level shutdown was deleted in v1.35.0.0.
+  async function shutdown(exitCode: number = 0) {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+
+    console.log('[browse] Shutting down...');
+    if (ownsTerminalAgent) {
+      // Identity-based kill (v1.44+). Replaces the v1.43- `pkill -f
+      // terminal-agent\.ts` regex teardown which matched sibling gstack
+      // sessions on the same host. Only the PID recorded in
+      // `<stateDir>/terminal-agent-pid` by THIS daemon's agent is signaled.
+      try {
+        const stateDir = path.dirname(config.stateFile);
+        const record = readAgentRecord(stateDir);
+        if (record) killAgentByRecord(record, 'SIGTERM');
+      } catch (err: any) {
+        console.warn('[browse] Failed to kill terminal-agent:', err.message);
+      }
+      safeUnlinkQuiet(path.join(path.dirname(config.stateFile), 'terminal-port'));
+      safeUnlinkQuiet(path.join(path.dirname(config.stateFile), 'terminal-internal-token'));
+      safeUnlinkQuiet(agentRecordPath(path.dirname(config.stateFile)));
+    }
+    try { detachSession(); } catch (err: any) {
+      console.warn('[browse] Failed to detach CDP session:', err.message);
+    }
+    inspectorSubscribers.clear();
+    if (cfgBrowserManager.isWatching()) cfgBrowserManager.stopWatch();
+    clearInterval(flushInterval);
+    clearInterval(idleCheckInterval);
+    if (agentWatchdogInterval) clearInterval(agentWatchdogInterval);
+    // Stop the session-persist ticker BEFORE the final snapshot below —
+    // paired with the isShuttingDown gate inside the tick, this guarantees
+    // no interval snapshot can race the final one during teardown.
+    if (sessionPersistInterval) {
+      clearInterval(sessionPersistInterval);
+      sessionPersistInterval = null;
+    }
+    await flushBuffers();
+
+    // Final session snapshot before the browser goes away (#778). Best
+    // effort with a hard 2s deadline: shutdown must never hang on a wedged
+    // page.evaluate — after the deadline we proceed to browser close and let
+    // the previous interval snapshot stand (atomic writes guarantee it's
+    // intact). The .catch is attached to the persist promise itself so a
+    // late rejection after losing the race can't become an unhandled
+    // rejection.
+    if (isSessionPersistEnabled()) {
+      const finalSnapshot = persistSessionState(cfgBrowserManager, path.join(config.stateDir, SESSION_STATE_FILE))
+        .catch((err: any) => {
+          console.warn(`[browse] SESSION_PERSIST_FAILED at shutdown: ${err?.message ?? err}`);
+        });
+      await Promise.race([
+        finalSnapshot,
+        new Promise<void>((resolve) => setTimeout(resolve, 2_000)),
+      ]);
+    }
+
+    await cfgBrowserManager.close();
+
+    cleanSingletonLocks(resolveChromiumProfile());
+    safeUnlinkQuiet(config.stateFile);
+    process.exit(exitCode);
+  }
+
+  // Named lifecycle helper (matches closeTunnel style). Logs failures so
+  // future debugging isn't blind to a stuck listener.
+  async function stopListeners(local: any, tunnel?: any) {
+    try { if (local?.stop) local.stop(true); }
+    catch (err: any) { console.warn('[browse] local listener stop failed:', err?.message || err); }
+    try { if (tunnel?.stop) tunnel.stop(true); }
+    catch (err: any) { console.warn('[browse] tunnel listener stop failed:', err?.message || err); }
+  }
+
+  // Register this handle's shutdown as the active one. Module-level
+  // handlers (idleCheckInterval, parent watchdog, onDisconnect, signal
+  // handlers) call activeShutdown so they reach THIS shutdown, not a stale
+  // module reference. Critical for embedders whose cfg.browserManager
+  // differs from the module-level instance.
+  activeShutdown = shutdown;
+
+  // Retarget the BrowserManager indirection at the cfg-instance so the
+  // module-level idleCheckTick + parent watchdog + SIGTERM handler all read
+  // the right connectionMode. Without this, headed embedders auto-shutdown
+  // after 30 min of HTTP idle because the dead module-level instance still
+  // reports connectionMode === 'launched'.
+  activeBrowserManager = cfgBrowserManager;
+  // Same reason as above: the watchdog reads activeBrowserManager, so the
+  // instance that can promote itself to headed must be the one that can
+  // suppress the headed parent-death branch. An embedder-supplied manager
+  // otherwise promotes silently and the watchdog keeps shutting down on a
+  // promotion it can no longer see.
+  cfgBrowserManager.onHeadedPromotion = suppressHeadedParentShutdown;
+
+  // Wire the cfg-instance's onDisconnect to run shutdown when the user
+  // closes the headed browser window. CHAIN any caller-provided handler
+  // instead of overwriting it: gbrowser may have set its own onDisconnect
+  // before calling buildFetchHandler (e.g. for snapshot/log work that needs
+  // to run before the process exits). Caller errors are logged but never
+  // block gstack shutdown — defensive symmetry with the safeUnlinkQuiet /
+  // safeKill philosophy in error-handling.ts.
+  const callerOnDisconnect = cfgBrowserManager.onDisconnect;
+  cfgBrowserManager.onDisconnect = async (code) => {
+    if (callerOnDisconnect) {
+      try { await callerOnDisconnect(code); }
+      catch (err: any) {
+        console.warn('[browse] caller onDisconnect threw:', err?.message ?? err);
+      }
+    }
+    await activeShutdown?.(code ?? 2);
+  };
+
+  // Substitute cfgBrowserManager for module-level browserManager in the
+  // dispatcher body so all browser-state reads/writes go through the cfg
+  // instance. Other module-level references (handleCommand, getTokenInfo,
+  // isRootRequest, etc.) take the token as a parameter and are passed
+  // `authToken` (the cfg-derived value) explicitly.
+  const browserManager = cfgBrowserManager;
+
+
   const makeFetchHandler = (surface: Surface) => async (req: Request): Promise<Response> => {
     const url = new URL(req.url);
 
@@ -1073,6 +1779,17 @@ async function start() {
       }
     }
 
+    // beforeRoute overlay hook (v1.35.0.0). Runs AFTER the tunnel surface
+    // filter and BEFORE per-route dispatch. Pre-resolves bearer auth once
+    // so the hook receives TokenInfo | null. Note: getTokenInfo returns null
+    // for both missing AND invalid bearer — see the ServerConfig.beforeRoute
+    // JSDoc for the security implications.
+    if (beforeRoute) {
+      const auth = getTokenInfo(req);
+      const overlayResp = await beforeRoute(req, surface, auth);
+      if (overlayResp) return overlayResp;
+    }
+
     // GET /connect — alive probe.  Unauth on both surfaces.  Used by /pair
     // and /tunnel/start to detect dead ngrok tunnels via the tunnel URL,
     // since /health is not tunnel-reachable under the dual-listener design.
@@ -1093,7 +1810,7 @@ async function start() {
 
       // Cookie picker routes — HTML page unauthenticated, data/action routes require auth
       if (url.pathname.startsWith('/cookie-picker')) {
-        return handleCookiePickerRoute(url, req, browserManager, AUTH_TOKEN);
+        return handleCookiePickerRoute(url, req, browserManager, authToken);
       }
 
       // Welcome page — served when GStack Browser launches in headed mode
@@ -1137,7 +1854,51 @@ async function start() {
         );
       }
 
-      // Health check — no auth required, does NOT reset idle timer
+      // ─── POST /extension-token — pinned-origin token bootstrap ──────
+      //
+      // The ONLY endpoint that hands out AUTH_TOKEN. GET /health used to
+      // carry the token (headed mode + any chrome-extension:// Origin),
+      // which meant ANY extension — or any localhost caller in headed
+      // mode — could read the root token. Now the token is released only
+      // to the one extension identity we ship: the Origin header must be
+      // exactly `chrome-extension://<GSTACK_EXTENSION_ID>`, where the ID
+      // is pinned by the "key" field in extension/manifest.json (derive
+      // it with `bun browse/scripts/extension-id.ts`). Chrome sets Origin
+      // on cross-origin POSTs from extension contexts and web pages
+      // cannot forge a chrome-extension:// Origin.
+      //
+      // Local listener only: NEVER added to TUNNEL_PATHS, so the tunnel
+      // surface 404s it by default-deny.
+      if (url.pathname === '/extension-token' && req.method === 'POST') {
+        // Defense-in-depth alongside the 127.0.0.1 bind: a DNS-rebinding
+        // page can't present a localhost Host header. Host arrives as
+        // '127.0.0.1:34567', so parse out the hostname — never compare
+        // the raw header (which carries the port) against a literal.
+        let hostname: string | null = null;
+        try {
+          hostname = new URL(`http://${req.headers.get('host') ?? ''}`).hostname;
+        } catch (err) {
+          if (!(err instanceof TypeError)) throw err;  // TypeError = malformed Host
+        }
+        const originOk =
+          req.headers.get('origin') === `chrome-extension://${GSTACK_EXTENSION_ID}`;
+        const hostOk = hostname === '127.0.0.1' || hostname === 'localhost';
+        if (!originOk || !hostOk) {
+          // No detail in the body — don't teach a probing caller which
+          // check failed.
+          return new Response(JSON.stringify({ error: 'Forbidden' }), {
+            status: 403, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return new Response(JSON.stringify({ token: authToken }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      // Health check — no auth required, does NOT reset idle timer.
+      // NEVER carries a token in any mode: token bootstrap is
+      // POST /extension-token (pinned extension Origin) and shell auth
+      // is POST /pty-session. Liveness/status only.
       if (url.pathname === '/health') {
         const healthy = await browserManager.isHealthy();
         return new Response(JSON.stringify({
@@ -1145,24 +1906,13 @@ async function start() {
           mode: browserManager.getConnectionMode(),
           uptime: Math.floor((Date.now() - startTime) / 1000),
           tabs: browserManager.getTabCount(),
-          // Auth token for extension bootstrap. Safe: /health is localhost-only.
-          // Previously served unconditionally, but that leaks the token if the
-          // server is tunneled to the internet (ngrok, SSH tunnel).
-          // In headed mode the server is always local, so return token unconditionally
-          // (fixes Playwright Chromium extensions that don't send Origin header).
-          ...(browserManager.getConnectionMode() === 'headed' ||
-              req.headers.get('origin')?.startsWith('chrome-extension://')
-              ? { token: AUTH_TOKEN } : {}),
-          // The chat queue is gone — Terminal pane is the sole sidebar
-          // surface. Keep `chatEnabled: false` so any older extension
-          // build still treats the chat input as disabled.
-          chatEnabled: false,
-          // Security module status — drives the shield icon in the sidepanel.
-          // Returns {status: 'protected'|'degraded'|'inactive', layers: {...}}.
-          // The chat-path classifier no longer feeds this since
-          // sidebar-agent.ts was ripped; only the page-content side
-          // (canary, content-security) keeps reporting in.
-          security: getSecurityStatus(),
+          // No `security` field (#2557): the only writer of the status it
+          // reported (sidebar-agent.ts's session-state file) went away with
+          // the chat path, so it read from a file nothing wrote — reporting
+          // a permanent 'inactive', or a stale false-green 'protected'
+          // wherever an old state file survived on disk. The live defenses
+          // (content-security L1-L3, the L4 sidecar on /pty-inject-scan)
+          // report through their own call sites, not through /health.
           // Terminal-agent discovery. ONLY a port number — never a token.
           // Tokens flow via the /pty-session HttpOnly cookie path. See
           // `pty-session-cookie.ts` for the rationale (codex outside-voice
@@ -1174,15 +1924,25 @@ async function start() {
         });
       }
 
-      // ─── /pty-session — mint Terminal-tab WebSocket cookie ───────────
+      // ─── /pty-session — mint sessionId + lease + attachToken ─────────
       //
-      // The extension POSTs here with the bootstrap AUTH_TOKEN, gets back a
-      // short-lived HttpOnly cookie scoped to the terminal-agent's /ws
-      // upgrade. We push the cookie value to the agent over loopback so the
-      // upgrade can validate it. The cookie travels automatically with the
-      // browser's WebSocket upgrade because it's same-origin to the agent
-      // when the daemon binds 127.0.0.1. NEVER added to TUNNEL_PATHS — the
-      // tunnel surface 404s any /pty-session attempt by default-deny.
+      // v1.44+ four-tuple shape:
+      //   { terminalPort, sessionId, attachToken, leaseExpiresAt }
+      //
+      //  - sessionId    : stable, non-secret. Safe to log. Identifies "this
+      //                   terminal" across re-attaches.
+      //  - attachToken  : short-lived (30 min wall, single attach in practice
+      //                   since the agent revokes on WS close). Bearer for
+      //                   the /ws upgrade.
+      //  - leaseExpiresAt: client-visible deadline for the lease. Re-attach
+      //                   only works inside this window.
+      //
+      // The lease + attachToken are minted together so a successful
+      // /pty-session is one round trip. Re-attach mints a fresh attachToken
+      // for the SAME sessionId via /pty-session/reattach.
+      //
+      // NEVER added to TUNNEL_PATHS — the tunnel surface 404s any
+      // /pty-session attempt by default-deny.
       if (url.pathname === '/pty-session' && req.method === 'POST') {
         if (!validateAuth(req)) {
           return new Response(JSON.stringify({ error: 'Unauthorized' }), {
@@ -1195,39 +1955,305 @@ async function start() {
             error: 'terminal-agent not ready',
           }), { status: 503, headers: { 'Content-Type': 'application/json' } });
         }
+        const lease = mintLease();
         const minted = mintPtySessionToken();
-        const granted = await grantPtyToken(minted.token);
+        const granted = await grantPtyToken(minted.token, lease.sessionId);
         if (!granted) {
           revokePtySessionToken(minted.token);
+          revokeLease(lease.sessionId);
           return new Response(JSON.stringify({
             error: 'failed to grant terminal session',
           }), { status: 503, headers: { 'Content-Type': 'application/json' } });
         }
         return new Response(JSON.stringify({
           terminalPort: port,
-          // Returned in the JSON body so the extension can pass it to
-          // `new WebSocket(url, [token])`. Browsers translate that to a
-          // `Sec-WebSocket-Protocol` header — the only auth header we can
-          // set from the browser WebSocket API. SameSite=Strict cookies
-          // don't survive the port change between server.ts (34567) and
-          // the agent (random port), and HttpOnly + cross-origin makes
-          // the cookie path unreliable across browsers anyway.
-          //
-          // The token is short-lived (30 min, auto-revoked on WS close)
-          // and never persisted to disk on the extension side. The
-          // pre-existing AUTH_TOKEN leak via /health is a separate
-          // concern (v1.1+ TODO).
+          sessionId: lease.sessionId,
+          attachToken: minted.token,
+          leaseExpiresAt: lease.expiresAt,
+          // Legacy alias — extensions still on the v1.43 wire shape keep
+          // working. Drop after one minor release once dogfood confirms.
           ptySessionToken: minted.token,
           expiresAt: minted.expiresAt,
         }), {
           status: 200,
           headers: {
             'Content-Type': 'application/json',
-            // Set-Cookie is kept for non-browser callers / future use,
-            // but the WS upgrade no longer depends on it.
             'Set-Cookie': buildPtySetCookie(minted.token),
           },
         });
+      }
+
+      // ─── /pty-session/reattach — mint fresh attachToken for existing sessionId
+      //
+      // Used by Commit 3's re-attach loop on the client. Validates the
+      // lease (rejects unknown/expired sessionId with 410 Gone), mints a
+      // fresh short-lived attachToken bound to the same sessionId, and
+      // pushes it to the agent. The client opens a new WS with the new
+      // token; the agent matches the sessionId binding and re-attaches
+      // to the existing PtySession (kept alive for the 60s detach
+      // window — Commit 3 wires that side).
+      if (url.pathname === '/pty-session/reattach' && req.method === 'POST') {
+        if (!validateAuth(req)) {
+          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+            status: 401, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        const port = readTerminalPort();
+        if (!port) {
+          return new Response(JSON.stringify({ error: 'terminal-agent not ready' }), {
+            status: 503, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        let body: any;
+        try { body = await req.json(); } catch { body = null; }
+        const sessionId = typeof body?.sessionId === 'string' ? body.sessionId : null;
+        const v = sessionId ? validateLease(sessionId) : { ok: false };
+        if (!v.ok) {
+          // 410 Gone — session window has closed (lease expired or never
+          // existed). Client must fall back to /pty-session for a brand-new
+          // session.
+          return new Response(JSON.stringify({ error: 'lease expired or unknown' }), {
+            status: 410, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        const minted = mintPtySessionToken();
+        const granted = await grantPtyToken(minted.token, sessionId!);
+        if (!granted) {
+          revokePtySessionToken(minted.token);
+          return new Response(JSON.stringify({ error: 'failed to grant attach token' }), {
+            status: 503, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return new Response(JSON.stringify({
+          terminalPort: port,
+          sessionId,
+          attachToken: minted.token,
+          leaseExpiresAt: v.ok ? v.expiresAt : 0,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+
+      // ─── /pty-restart — one-transaction kill + fresh mint ────────────
+      //
+      // The Restart button. Synchronously disposes the caller's existing
+      // PtySession on the agent, revokes the old lease, mints a fresh
+      // sessionId + lease + attachToken, and returns the new 4-tuple in
+      // one response. Zero race window between kill and mint (codex T2
+      // + D8 of the eng review).
+      if (url.pathname === '/pty-restart' && req.method === 'POST') {
+        if (!validateAuth(req)) {
+          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+            status: 401, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        const port = readTerminalPort();
+        if (!port) {
+          return new Response(JSON.stringify({ error: 'terminal-agent not ready' }), {
+            status: 503, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        let body: any;
+        try { body = await req.json(); } catch { body = null; }
+        const oldSessionId = typeof body?.sessionId === 'string' ? body.sessionId : null;
+        // Best-effort dispose. Missing/unknown sessionId is non-fatal —
+        // the client may be doing a "restart from scratch" with no prior
+        // session (e.g. ENDED state). The fresh mint always proceeds.
+        if (oldSessionId) {
+          await restartPtySession(oldSessionId);
+          revokeLease(oldSessionId);
+        }
+        const lease = mintLease();
+        const minted = mintPtySessionToken();
+        const granted = await grantPtyToken(minted.token, lease.sessionId);
+        if (!granted) {
+          revokePtySessionToken(minted.token);
+          revokeLease(lease.sessionId);
+          return new Response(JSON.stringify({ error: 'failed to grant terminal session' }), {
+            status: 503, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return new Response(JSON.stringify({
+          terminalPort: port,
+          sessionId: lease.sessionId,
+          attachToken: minted.token,
+          leaseExpiresAt: lease.expiresAt,
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+
+      // ─── /pty-dispose — explicit teardown (pagehide / browser quit) ──
+      //
+      // sendBeacon-compatible: accepts the auth token in the BODY so the
+      // extension's pagehide handler can fire it without setting headers
+      // (sendBeacon doesn't support custom headers). Codex T3 fix —
+      // without this, every browser quit + sidebar close leaves a zombie
+      // PTY alive for the 60s detach window (Commit 3).
+      if (url.pathname === '/pty-dispose' && req.method === 'POST') {
+        let body: any;
+        try { body = await req.json(); } catch { body = null; }
+        const authTokenFromBody = typeof body?.authToken === 'string' ? body.authToken : null;
+        // Accept either header bearer OR body authToken. Both must match
+        // the root auth token; otherwise reject.
+        const headerToken = extractToken(req);
+        const authedByHeader = headerToken !== null && headerToken === authToken;
+        const authedByBody = authTokenFromBody !== null && authTokenFromBody === authToken;
+        if (!authedByHeader && !authedByBody) {
+          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+            status: 401, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        const sessionId = typeof body?.sessionId === 'string' ? body.sessionId : null;
+        if (sessionId) {
+          await restartPtySession(sessionId);
+          revokeLease(sessionId);
+        }
+        return new Response(JSON.stringify({ ok: true }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      // ─── /internal/lease-refresh — loopback from terminal-agent on keepalive
+      //
+      // T6 PTY-only idle reset (codex outside-voice fix): the headless
+      // daemon's idle timer must reset only on active PTY usage, not on
+      // every passive SSE consumer. Terminal-agent calls this endpoint
+      // (lazily, only when its cached lease is within 5 min of expiry)
+      // on its 25s keepalive cycle. Refreshing the lease here also bumps
+      // lastActivity so the daemon stays alive while a sidebar terminal
+      // is actively in use.
+      //
+      // INTERNAL endpoint — bound to the root authToken so an external
+      // caller can't refresh another user's lease. Body: {sessionId}.
+      if (url.pathname === '/internal/lease-refresh' && req.method === 'POST') {
+        if (!validateAuth(req)) {
+          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+            status: 401, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        let body: any;
+        try { body = await req.json(); } catch { body = null; }
+        const sessionId = typeof body?.sessionId === 'string' ? body.sessionId : null;
+        const r = sessionId ? refreshLease(sessionId) : { ok: false };
+        if (!r.ok) {
+          return new Response(JSON.stringify({ error: 'lease expired or unknown' }), {
+            status: 410, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        // T6: PTY activity resets the daemon idle timer.
+        resetIdleTimer();
+        return new Response(JSON.stringify({ ok: true, expiresAt: r.expiresAt }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
+      // ─── /pty-inject-scan — pre-inject prompt-injection scan for the
+      // extension's gstackInjectToTerminal callers. The extension routes
+      // every page-derived text through this endpoint BEFORE writing to
+      // the PTY (#1370). Local-only by intent: not added to the tunnel
+      // allowlist; root-token auth required. Sidecar absence degrades to
+      // L4 unavailable (extension shows WARN + user confirm per D7).
+      if (url.pathname === '/pty-inject-scan' && req.method === 'POST') {
+        if (!validateAuth(req)) {
+          return new Response(
+            JSON.stringify({ error: 'Unauthorized' }, sanitizeReplacer),
+            { status: 401, headers: { 'Content-Type': 'application/json' } },
+          );
+        }
+        // 64KB request cap. Defense against accidentally posting an
+        // entire page DOM into the PTY path.
+        const contentLength = Number(req.headers.get('content-length') || '0');
+        if (contentLength > 64 * 1024) {
+          return new Response(
+            JSON.stringify({ error: 'payload-too-large', limit: 65536 }, sanitizeReplacer),
+            { status: 413, headers: { 'Content-Type': 'application/json' } },
+          );
+        }
+        let body: { text?: unknown; origin?: unknown } = {};
+        try {
+          body = (await req.json()) as { text?: unknown; origin?: unknown };
+        } catch {
+          return new Response(
+            JSON.stringify({ error: 'malformed-json' }, sanitizeReplacer),
+            { status: 400, headers: { 'Content-Type': 'application/json' } },
+          );
+        }
+        const text = typeof body.text === 'string' ? body.text : '';
+        const origin = typeof body.origin === 'string' ? body.origin : 'unknown';
+        if (text.length === 0) {
+          return new Response(
+            JSON.stringify({ error: 'missing-text' }, sanitizeReplacer),
+            { status: 400, headers: { 'Content-Type': 'application/json' } },
+          );
+        }
+
+        // L1-L3 honest accounting (codex review correction):
+        //   - URL blocklist forced to BLOCK in PTY context (override
+        //     BROWSE_CONTENT_FILTER default — page-derived text in the
+        //     REPL is a higher-risk surface than ordinary tool output).
+        //   - L4 ML classifier via the sidecar when available.
+        //   - L1-L3 envelope/datamarking is INFORMATIONAL only; the
+        //     verdict is driven by the URL blocklist + L4.
+        // See CLAUDE.md "Sidebar security stack" + plan §"L1-L3 honest
+        // accounting".
+        let verdict: 'PASS' | 'WARN' | 'BLOCK' = 'PASS';
+        const reasons: string[] = [];
+
+        // Quick URL-blocklist check (re-uses the security module's
+        // pure-string helpers — no @huggingface/transformers dep).
+        // Pattern: text containing a known bad-actor domain → BLOCK.
+        if (/(\bbit\.ly|\btinyurl\.com|\bdiscord\.gg)/i.test(text)) {
+          verdict = 'BLOCK';
+          reasons.push('url-blocklist');
+        }
+
+        // L4 sidecar scan if available.
+        const sidecarAvail = isSidecarAvailable();
+        let l4: { available: boolean; verdict?: unknown; error?: string } = {
+          available: sidecarAvail.available,
+        };
+        if (sidecarAvail.available && verdict !== 'BLOCK') {
+          try {
+            const { verdict: layerVerdict } = await scanWithSidecar(text, {
+              timeoutMs: 5000,
+            });
+            l4 = { available: true, verdict: layerVerdict };
+            // LayerSignal shape: { verdict: 'safe'|'suspicious'|'unsafe', ... }
+            const lv = (layerVerdict as { verdict?: string })?.verdict;
+            if (lv === 'unsafe') {
+              verdict = 'BLOCK';
+              reasons.push('l4-unsafe');
+            } else if (lv === 'suspicious') {
+              verdict = 'WARN';
+              reasons.push('l4-suspicious');
+            }
+          } catch (err) {
+            l4 = {
+              available: false,
+              error: err instanceof Error ? err.message : String(err),
+            };
+            // L4 failure during scan: degrade to WARN per D7.
+            if (verdict === 'PASS') {
+              verdict = 'WARN';
+              reasons.push('l4-unavailable');
+            }
+          }
+        } else if (!sidecarAvail.available && verdict === 'PASS') {
+          verdict = 'WARN';
+          reasons.push(`l4-unavailable:${sidecarAvail.reason ?? 'unknown'}`);
+        }
+
+        // BLOCK decisions are surfaced in the response shape; the
+        // existing writeDecision audit log is tab-scoped (per-page) and
+        // doesn't fit the PTY surface. The extension logs the BLOCK
+        // event into its own activity feed on receipt, which keeps the
+        // audit signal observable without bolting a new attempts.jsonl
+        // onto the server.
+
+        return new Response(
+          JSON.stringify(
+            { verdict, reasons, l4, datamark: '<untrusted-page-content>' },
+            sanitizeReplacer,
+          ),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
       }
 
       // ─── /connect — setup key exchange for /pair-agent ceremony ────
@@ -1292,7 +2318,14 @@ async function start() {
             scopes: session.scopes,
             agent: session.clientId,
           }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-        } catch {
+        } catch (err) {
+          // Name the caller's typo (bad scope, negative rateLimit, reserved
+          // clientId) instead of hiding it behind the generic body error.
+          if (err instanceof InvalidScopeError || err instanceof ReservedClientIdError) {
+            return new Response(JSON.stringify({ error: err.message }), {
+              status: 400, headers: { 'Content-Type': 'application/json' },
+            });
+          }
           return new Response(JSON.stringify({ error: 'Invalid request body' }), {
             status: 400, headers: { 'Content-Type': 'application/json' },
           });
@@ -1306,15 +2339,28 @@ async function start() {
             status: 403, headers: { 'Content-Type': 'application/json' },
           });
         }
-        const clientId = url.pathname.slice('/token/'.length);
+        // decodeURIComponent so CLI-encoded names (spaces, UTF-8) round-trip.
+        let clientId: string;
+        try {
+          clientId = decodeURIComponent(url.pathname.slice('/token/'.length));
+        } catch {
+          return new Response(JSON.stringify({ error: 'Malformed client ID encoding' }), {
+            status: 400, headers: { 'Content-Type': 'application/json' },
+          });
+        }
         const revoked = revokeToken(clientId);
-        if (!revoked) {
+        // Release tabs UNCONDITIONALLY: ownership outlives the token (it clears
+        // only on tab close), so a client whose token already expired can still
+        // own tabs. Gating release on a revoke hit would orphan that ownership
+        // and let a same-name re-pair inherit an authenticated tab.
+        const tabsReleased = browserManager.releaseClientTabs(clientId).length;
+        if (!revoked && tabsReleased === 0) {
           return new Response(JSON.stringify({ error: `Agent "${clientId}" not found` }), {
             status: 404, headers: { 'Content-Type': 'application/json' },
           });
         }
-        console.log(`[browse] Revoked token for: ${clientId}`);
-        return new Response(JSON.stringify({ revoked: clientId }), {
+        console.log(`[browse] Revoked ${revoked} token(s), released ${tabsReleased} tab(s) for: ${clientId}`);
+        return new Response(JSON.stringify({ revoked: clientId, tokens_deleted: revoked, tabs_released: tabsReleased }), {
           status: 200, headers: { 'Content-Type': 'application/json' },
         });
       }
@@ -1326,13 +2372,17 @@ async function start() {
             status: 403, headers: { 'Content-Type': 'application/json' },
           });
         }
-        const agents = listTokens().map(t => ({
+        // includeSetup: pending (unexchanged) setup keys are live grants the
+        // operator must be able to see — without them, revoking a paired-but-
+        // never-connected agent "works" while the list shows nothing.
+        const agents = listTokens({ includeSetup: true }).map(t => ({
           clientId: t.clientId,
           scopes: t.scopes,
           domains: t.domains,
           expiresAt: t.expiresAt,
           commandCount: t.commandCount,
           createdAt: t.createdAt,
+          pending: t.type === 'setup',
         }));
         return new Response(JSON.stringify({ agents }), {
           status: 200, headers: { 'Content-Type': 'application/json' },
@@ -1348,12 +2398,61 @@ async function start() {
         }
         try {
           const pairBody = await req.json() as any;
-          // Default: full access (read+write+admin+meta). The trust boundary is
-          // the pairing ceremony itself, not the scope. --control adds browser-wide
-          // destructive commands (stop, restart, disconnect). --restrict limits scope.
+          // Reject a reserved/invalid clientId up front (createSetupKey enforces
+          // it too, but this makes the 400 unambiguous and skips the teardown).
+          if (pairBody.clientId !== undefined) assertValidClientId(pairBody.clientId);
+          // Default: DEFAULT_PAIR_SCOPES (full page access). The trust boundary
+          // is the pairing ceremony itself, not the scope. --control adds
+          // browser-wide destructive commands (stop, restart, disconnect).
+          // --restrict limits scope — but can never grant control: that scope
+          // stays behind the explicit control flag.
+          if (!pairBody.control && !pairBody.admin
+              && Array.isArray(pairBody.scopes) && pairBody.scopes.includes('control')) {
+            return new Response(JSON.stringify({
+              error: 'The control scope requires the control flag (--control); it cannot be granted via a scopes list.',
+            }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+          }
           const scopes = pairBody.control || pairBody.admin
-            ? ['read', 'write', 'admin', 'meta', 'control'] as const
-            : (pairBody.scopes || ['read', 'write', 'admin', 'meta']) as const;
+            ? [...DEFAULT_PAIR_SCOPES, 'control' as const]
+            : ((pairBody.scopes || [...DEFAULT_PAIR_SCOPES]) as ScopeCategory[]);
+          // D1: a re-pair supersedes prior grants. ALWAYS drop stale setup keys
+          // so a superseded broad key can never be exchanged — this closes the
+          // shadow-key hole where a narrowing re-pair before the agent connects
+          // would otherwise leave the old broad key live. Revoke the live
+          // SESSION only when the new grant actually reduces access, so a
+          // broaden/refresh never strands a working agent mid-task. Compare
+          // against the resolved grant (not raw pairBody) so dropping 'control'
+          // or a default re-pair is classified correctly. Revoke runs BEFORE
+          // createSetupKey — revokeToken deletes all of a clientId's tokens, so
+          // minting first would nuke the fresh key.
+          const grant = {
+            scopes: [...scopes] as ScopeCategory[],
+            domains: pairBody.domains as string[] | undefined,
+            rateLimit: pairBody.rateLimit ?? 10,
+            tabPolicy: 'own-only' as const,
+          };
+          // Validate BEFORE any revoke (createSetupKey validates too, but that
+          // runs after the teardown below). A bad scope or negative rateLimit
+          // must 400 without knocking a live session offline — otherwise a
+          // reducing re-pair with a typo (--restrict red) destroys the session
+          // and mints no replacement.
+          assertValidTokenOptions(grant.scopes, grant.rateLimit);
+          const priorSession = pairBody.clientId ? getClientSession(pairBody.clientId) : null;
+          let superseded: { tokens_deleted: number; tabs_released: number } | undefined;
+          if (priorSession && grantReducesAccess(priorSession, grant)) {
+            const tokensDeleted = revokeToken(pairBody.clientId);
+            const tabsReleased = browserManager.releaseClientTabs(pairBody.clientId).length;
+            superseded = { tokens_deleted: tokensDeleted, tabs_released: tabsReleased };
+            console.log(`[browse] Superseded ${tokensDeleted} token(s), released ${tabsReleased} tab(s) for reducing re-pair: ${pairBody.clientId}`);
+          } else if (pairBody.clientId) {
+            revokeSetupKeys(pairBody.clientId);
+            // No live session, but tab ownership outlives token expiry: free any
+            // tabs orphaned by an expired session so this re-pair can't inherit
+            // an earlier incarnation's authenticated pages (mirrors DELETE
+            // /token's unconditional release). A live-session broaden keeps its
+            // tabs — the working agent still owns them.
+            if (!priorSession) browserManager.releaseClientTabs(pairBody.clientId);
+          }
           const setupKey = createSetupKey({
             clientId: pairBody.clientId,
             scopes: [...scopes],
@@ -1387,9 +2486,17 @@ async function start() {
             expires_at: setupKey.expiresAt,
             scopes: setupKey.scopes,
             tunnel_url: verifiedTunnelUrl,
-            server_url: `http://127.0.0.1:${server?.port || 0}`,
+            server_url: `http://127.0.0.1:${browsePort}`,
+            ...(superseded ? { superseded } : {}),
           }), { status: 200, headers: { 'Content-Type': 'application/json' } });
-        } catch {
+        } catch (err) {
+          // Name the caller's typo (bad scope, negative rateLimit, reserved
+          // clientId) instead of hiding it behind the generic body error.
+          if (err instanceof InvalidScopeError || err instanceof ReservedClientIdError) {
+            return new Response(JSON.stringify({ error: err.message }), {
+              status: 400, headers: { 'Content-Type': 'application/json' },
+            });
+          }
           return new Response(JSON.stringify({ error: 'Invalid request body' }), {
             status: 400, headers: { 'Content-Type': 'application/json' },
           });
@@ -1401,7 +2508,7 @@ async function start() {
       // Dual-listener model: binds a SECOND Bun.serve listener on an
       // ephemeral 127.0.0.1 port dedicated to tunnel traffic, then points
       // ngrok.forward() at THAT port.  The existing local listener (which
-      // serves /health+token, /cookie-picker, /inspector/*, welcome, etc.)
+      // serves /extension-token, /cookie-picker, /inspector/*, welcome, etc.)
       // is never exposed to ngrok.
       //
       // Hard fail if the tunnel listener bind fails — NEVER fall back to
@@ -1412,6 +2519,14 @@ async function start() {
           return new Response(JSON.stringify({ error: 'Root token required' }), {
             status: 403, headers: { 'Content-Type': 'application/json' },
           });
+        }
+        if (!isPairAgentEnabled()) {
+          // Consent-on-first-use: the /pair-agent skill asks once and sets the
+          // key; a direct API caller gets the same hint instead of a tunnel.
+          return new Response(JSON.stringify({
+            error: 'pair-agent is off (tunnel exposes this browser beyond the machine)',
+            hint: 'enable once with: gstack-config set pair_agent on — or run /pair-agent, which asks for consent and sets it',
+          }), { status: 403, headers: { 'Content-Type': 'application/json' } });
         }
         if (tunnelActive && tunnelUrl && tunnelServer) {
           // Verify tunnel is still alive before returning cached URL.
@@ -1443,58 +2558,24 @@ async function start() {
           }), { status: 400, headers: { 'Content-Type': 'application/json' } });
         }
 
-        // 2) Bind the tunnel listener on an ephemeral port.  HARD FAIL if
-        //    this errors — never fall back to the local port.
-        let boundTunnel: ReturnType<typeof Bun.serve>;
-        try {
-          boundTunnel = Bun.serve({
-            port: 0,
-            hostname: '127.0.0.1',
-            fetch: makeFetchHandler('tunnel'),
-          });
-        } catch (err: any) {
+        // 2) Bind the tunnel listener + open ngrok via the shared helper
+        //    (see startTunnel — hard-fails the bind, cleans up both ngrok
+        //    and the Bun listener on any post-bind failure).
+        const started = await startTunnel({
+          fetchHandler: makeFetchHandler('tunnel'),
+          authtoken,
+          consent: 'pair_agent=on (isPairAgentEnabled gate at /tunnel/start)',
+        });
+        if (!started.ok) {
           return new Response(JSON.stringify({
-            error: `Failed to bind tunnel listener: ${err.message}`,
+            error: started.stage === 'bind'
+              ? `Failed to bind tunnel listener: ${started.error.message}`
+              : `Failed to open ngrok tunnel: ${started.error.message}`,
           }), { status: 500, headers: { 'Content-Type': 'application/json' } });
         }
-        const tunnelPort = boundTunnel.port;
-
-        // 3) Point ngrok at the TUNNEL port (not the local port).  If this
-        //    fails, tear the listener back down so we don't leak sockets.
-        try {
-          const ngrok = await import('@ngrok/ngrok');
-          const domain = process.env.NGROK_DOMAIN;
-          const forwardOpts: any = { addr: tunnelPort, authtoken };
-          if (domain) forwardOpts.domain = domain;
-
-          tunnelListener = await ngrok.forward(forwardOpts);
-          tunnelUrl = tunnelListener.url();
-          tunnelServer = boundTunnel;
-          tunnelActive = true;
-          console.log(`[browse] Tunnel listener bound on 127.0.0.1:${tunnelPort}, ngrok → ${tunnelUrl}`);
-
-          // Update state file
-          const stateContent = JSON.parse(fs.readFileSync(config.stateFile, 'utf-8'));
-          stateContent.tunnel = { url: tunnelUrl, domain: domain || null, startedAt: new Date().toISOString() };
-          const tmpState = config.stateFile + '.tmp';
-          fs.writeFileSync(tmpState, JSON.stringify(stateContent, null, 2), { mode: 0o600 });
-          fs.renameSync(tmpState, config.stateFile);
-
-          return new Response(JSON.stringify({ url: tunnelUrl }), {
-            status: 200, headers: { 'Content-Type': 'application/json' },
-          });
-        } catch (err: any) {
-          // Clean up BOTH ngrok and the Bun listener on failure.  If
-          // ngrok.forward() succeeded but tunnelListener.url() or the
-          // state-file write threw, we'd otherwise leak an active ngrok
-          // session on the user's account.
-          try { if (tunnelListener) await tunnelListener.close(); } catch {}
-          try { boundTunnel.stop(true); } catch {}
-          tunnelListener = null;
-          return new Response(JSON.stringify({
-            error: `Failed to open ngrok tunnel: ${err.message}`,
-          }), { status: 500, headers: { 'Content-Type': 'application/json' } });
-        }
+        return new Response(JSON.stringify({ url: started.url }), {
+          status: 200, headers: { 'Content-Type': 'application/json' },
+        });
       }
 
       // ─── SSE session cookie mint (auth required) ──────────────────
@@ -1563,57 +2644,19 @@ async function start() {
           });
         }
         const afterId = parseInt(url.searchParams.get('after') || '0', 10);
-        const encoder = new TextEncoder();
-
-        const stream = new ReadableStream({
-          start(controller) {
-            // 1. Gap detection + replay
+        // Cleanup contract (abort + enqueue-fail + heartbeat-fail, all
+        // idempotent) lives in createSseEndpoint; sanitizeReplacer is
+        // applied to every JSON.stringify inside the helper, so
+        // page-content-derived fields (URLs, command args, errors)
+        // stay surrogate-safe per CLAUDE.md egress invariant.
+        return createSseEndpoint(req, {
+          initialReplay: (send) => {
             const { entries, gap, gapFrom, availableFrom } = getActivityAfter(afterId);
-            if (gap) {
-              controller.enqueue(encoder.encode(`event: gap\ndata: ${JSON.stringify({ gapFrom, availableFrom })}\n\n`));
-            }
-            for (const entry of entries) {
-              controller.enqueue(encoder.encode(`event: activity\ndata: ${JSON.stringify(entry)}\n\n`));
-            }
-
-            // 2. Subscribe for live events
-            const unsubscribe = subscribe((entry) => {
-              try {
-                controller.enqueue(encoder.encode(`event: activity\ndata: ${JSON.stringify(entry)}\n\n`));
-              } catch (err: any) {
-                console.debug('[browse] Activity SSE stream error, unsubscribing:', err.message);
-                unsubscribe();
-              }
-            });
-
-            // 3. Heartbeat every 15s
-            const heartbeat = setInterval(() => {
-              try {
-                controller.enqueue(encoder.encode(`: heartbeat\n\n`));
-              } catch (err: any) {
-                console.debug('[browse] Activity SSE heartbeat failed:', err.message);
-                clearInterval(heartbeat);
-                unsubscribe();
-              }
-            }, 15000);
-
-            // 4. Cleanup on disconnect
-            req.signal.addEventListener('abort', () => {
-              clearInterval(heartbeat);
-              unsubscribe();
-              try { controller.close(); } catch {
-                // Expected: stream already closed
-              }
-            });
+            if (gap) send('gap', { gapFrom, availableFrom });
+            for (const entry of entries) send('activity', entry);
           },
-        });
-
-        return new Response(stream, {
-          headers: {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-          },
+          subscribe,
+          liveEventName: 'activity',
         });
       }
 
@@ -1632,15 +2675,6 @@ async function start() {
           headers: { 'Content-Type': 'application/json' },
         });
       }
-
-
-      // ─── Sidebar chat endpoints ripped ──────────────────────────────
-      // /sidebar-tabs, /sidebar-tabs/switch, /sidebar-chat[/clear],
-      // /sidebar-command, /sidebar-agent/{event,kill,stop},
-      // /sidebar-queue/dismiss, /sidebar-session{,/new,/list} all lived
-      // here. They drove the one-shot claude -p chat queue. Replaced by
-      // the interactive PTY in terminal-agent.ts; the queue + browser-tab
-      // multiplexing are no longer needed.
 
 
       // ─── Batch endpoint — N commands, 1 HTTP round-trip ─────────────
@@ -1700,10 +2734,13 @@ async function start() {
             tokenInfo,
             { skipRateCheck: true, skipActivity: true },
           );
+          // Sanitize lone surrogates per-result (#1440 — /batch bypasses the
+          // handleCommand chokepoint, so it needs its own sanitization).
+          const safeResult = typeof cr.result === 'string' ? sanitizeBody(cr.result, !!cr.json) : cr.result;
           results.push({
             index: i,
             status: cr.status,
-            result: cr.result,
+            result: safeResult,
             command: cmd.command,
             tabId: cmd.tabId,
           });
@@ -1723,13 +2760,17 @@ async function start() {
           clientId: tokenInfo?.clientId,
         });
 
-        return new Response(JSON.stringify({
+        // Sanitize the JSON envelope a second time (defense in depth) — catches
+        // any \uXXXX escape sequences for lone surrogates that survived the
+        // per-result pass.
+        const batchBody = stripLoneSurrogateEscapes(JSON.stringify({
           results,
           duration,
           total: commands.length,
           succeeded: results.filter(r => r.status === 200).length,
           failed: results.filter(r => r.status !== 200).length,
-        }), {
+        }));
+        return new Response(batchBody, {
           status: 200,
           headers: { 'Content-Type': 'application/json' },
         });
@@ -1806,11 +2847,11 @@ async function start() {
         // Paired remote agents drive the browser but cannot configure the
         // daemon, launch new browsers, import cookies, or rotate tokens.
         if (surface === 'tunnel') {
-          if (!canDispatchOverTunnel(body?.command)) {
+          if (!canDispatchOverTunnel(body?.command, body?.args)) {
             logTunnelDenial(req, url, `disallowed_command:${body?.command}`);
             return new Response(JSON.stringify({
               error: `Command '${body?.command}' is not allowed over the tunnel surface`,
-              hint: `Tunnel commands: ${[...TUNNEL_COMMANDS].sort().join(', ')}`,
+              hint: `Tunnel commands: ${[...TUNNEL_COMMANDS].sort().join(', ')}. Note: --out (disk write) is never allowed over the tunnel.`,
             }), { status: 403, headers: { 'Content-Type': 'application/json' } });
           }
         }
@@ -1915,6 +2956,31 @@ async function start() {
         });
       }
 
+      // GET /memory — diagnostic snapshot (auth required, does NOT reset idle).
+      // Same auth model as /activity/stream and /inspector/events: Bearer header
+      // OR view-only SSE-session cookie. Does NOT extend /health (which is
+      // unauthenticated liveness-only — token bootstrap moved to the pinned
+      // POST /extension-token); a separate endpoint with the standard SSE auth
+      // keeps /health free of anything worth stealing.
+      if (url.pathname === '/memory' && req.method === 'GET') {
+        const cookieToken = extractSseCookie(req);
+        if (!validateAuth(req) && !validateSseSessionToken(cookieToken)) {
+          return new Response(JSON.stringify({ error: 'Unauthorized' }), {
+            status: 401, headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        const { buildMemorySnapshotJson } = await import('./memory-command');
+        const snapshot = await buildMemorySnapshotJson(cfgBrowserManager);
+        // sanitizeReplacer is required at every SSE/JSON egress that ships
+        // page-content-derived strings — tab.url and tab.title come from
+        // page content, so lone-surrogate bytes from broken emoji or
+        // mid-emoji splits could otherwise reach the sidebar / Claude API.
+        return new Response(JSON.stringify(snapshot, sanitizeReplacer), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+
       // GET /inspector/events — SSE for inspector state changes (auth required)
       if (url.pathname === '/inspector/events' && req.method === 'GET') {
         // Same auth model as /activity/stream: Bearer OR view-only cookie.
@@ -1925,85 +2991,248 @@ async function start() {
             status: 401, headers: { 'Content-Type': 'application/json' },
           });
         }
-        const encoder = new TextEncoder();
-        const stream = new ReadableStream({
-          start(controller) {
-            // Send current state immediately
-            if (inspectorData) {
-              controller.enqueue(encoder.encode(
-                `event: state\ndata: ${JSON.stringify({ data: inspectorData, timestamp: inspectorTimestamp })}\n\n`
-              ));
-            }
-
-            // Subscribe for live events
-            const notify: InspectorSubscriber = (event) => {
-              try {
-                controller.enqueue(encoder.encode(
-                  `event: inspector\ndata: ${JSON.stringify(event)}\n\n`
-                ));
-              } catch (err: any) {
-                console.debug('[browse] Inspector SSE stream error:', err.message);
-                inspectorSubscribers.delete(notify);
-              }
-            };
+        // Cleanup contract (abort + enqueue-fail + heartbeat-fail,
+        // idempotent) lives in createSseEndpoint; sanitizeReplacer is
+        // applied to every JSON.stringify inside the helper. The
+        // inspector subscriber set stays here because it's also written
+        // to by emitInspectorEvent above.
+        return createSseEndpoint(req, {
+          initialReplay: inspectorData
+            ? (send) => send('state', { data: inspectorData, timestamp: inspectorTimestamp })
+            : undefined,
+          subscribe: (notify) => {
             inspectorSubscribers.add(notify);
-
-            // Heartbeat every 15s
-            const heartbeat = setInterval(() => {
-              try {
-                controller.enqueue(encoder.encode(`: heartbeat\n\n`));
-              } catch (err: any) {
-                console.debug('[browse] Inspector SSE heartbeat failed:', err.message);
-                clearInterval(heartbeat);
-                inspectorSubscribers.delete(notify);
-              }
-            }, 15000);
-
-            // Cleanup on disconnect
-            req.signal.addEventListener('abort', () => {
-              clearInterval(heartbeat);
-              inspectorSubscribers.delete(notify);
-              try { controller.close(); } catch (err: any) {
-                // Expected: stream already closed
-              }
-            });
+            return () => inspectorSubscribers.delete(notify);
           },
-        });
-
-        return new Response(stream, {
-          headers: {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-          },
+          liveEventName: 'inspector',
         });
       }
 
       return new Response('Not found', { status: 404 });
   };
-  // ─── End of makeFetchHandler ────────────────────────────────────
+
+  return {
+    fetchLocal: makeFetchHandler('local'),
+    fetchTunnel: makeFetchHandler('tunnel'),
+    shutdown,
+    stopListeners,
+  };
+}
+
+export async function start() {
+  // Clear old log files
+  safeUnlink(CONSOLE_LOG_PATH);
+  safeUnlink(NETWORK_LOG_PATH);
+  safeUnlink(DIALOG_LOG_PATH);
+
+  const port = await findPort();
+  LOCAL_LISTEN_PORT = port;
+
+  // ─── Proxy config (D8 + codex F5) ──────────────────────────────
+  // BROWSE_PROXY_URL is set by the CLI when --proxy was passed. For SOCKS5
+  // with auth, we run a local 127.0.0.1 bridge that relays to the
+  // authenticated upstream (Chromium can't do SOCKS5 auth itself). For
+  // HTTP/HTTPS or unauthenticated SOCKS5, we pass the URL directly to
+  // Chromium's proxy.server option.
+  let proxyBridge: BridgeHandle | null = null;
+  const proxyUrl = process.env.BROWSE_PROXY_URL;
+  if (proxyUrl) {
+    let parsed;
+    try {
+      parsed = parseProxyConfig({
+        proxyUrl,
+        envUser: process.env.BROWSE_PROXY_USER,
+        envPass: process.env.BROWSE_PROXY_PASS,
+      });
+    } catch (err) {
+      if (err instanceof ProxyConfigError) {
+        console.error(`[browse] error: ${err.message} (${err.hint})`);
+        process.exit(1);
+      }
+      throw err;
+    }
+
+    if (parsed.scheme === 'socks5' && parsed.hasAuth) {
+      // Pre-flight: verify upstream accepts our creds before launching
+      // Chromium. 5s budget, 3 retries with 500ms backoff (D4: handles VPN
+      // warm-up race). On failure, exit with redacted error.
+      console.log(`[browse] Testing SOCKS5 upstream ${redactProxyUrl(proxyUrl)}...`);
+      try {
+        const test = await testUpstream({
+          upstream: toUpstreamConfig(parsed),
+          budgetMs: 5000,
+          retries: 3,
+          backoffMs: 500,
+        });
+        console.log(`[browse] [proxy] upstream test ok in ${test.ms}ms (${test.attempts} attempt${test.attempts === 1 ? '' : 's'})`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[browse] [proxy] FAIL upstream ${redactProxyUrl(proxyUrl)}: ${msg}`);
+        process.exit(1);
+      }
+
+      proxyBridge = await startSocksBridge({ upstream: toUpstreamConfig(parsed) });
+      console.log(`[browse] [proxy] bridge listening on 127.0.0.1:${proxyBridge.port}`);
+      browserManager.setProxyConfig({ server: `socks5://127.0.0.1:${proxyBridge.port}` });
+    } else {
+      // HTTP/HTTPS or unauth SOCKS5 — pass through to Chromium directly.
+      browserManager.setProxyConfig({
+        server: `${parsed.scheme}://${parsed.host}:${parsed.port}`,
+        ...(parsed.userId ? { username: parsed.userId } : {}),
+        ...(parsed.password ? { password: parsed.password } : {}),
+      });
+      console.log(`[browse] [proxy] using ${redactProxyUrl(proxyUrl)} (pass-through to Chromium)`);
+    }
+
+    // Tear down bridge on shutdown.
+    process.on('exit', () => {
+      if (proxyBridge) {
+        proxyBridge.close().catch(() => { /* shutting down anyway */ });
+      }
+    });
+  }
+
+  // ─── Xvfb auto-spawn (Linux + headed + no DISPLAY) ─────────────
+  // codex F2: walk display range to pick a free one (never hardcode :99);
+  // record start-time alongside PID so cleanup can validate ownership and
+  // not kill a recycled PID.
+  let xvfb: XvfbHandle | null = null;
+  const xvfbDecision = shouldSpawnXvfb(process.env, process.platform);
+  if (xvfbDecision.spawn) {
+    const displayNum = pickFreeDisplay();
+    if (displayNum == null) {
+      console.error('[browse] no free X display in range :99-:120 — refusing to clobber existing X servers');
+      process.exit(1);
+    }
+    try {
+      xvfb = await spawnXvfb(displayNum);
+      process.env.DISPLAY = xvfb.display;
+      console.log(`[browse] [xvfb] spawned on ${xvfb.display} (pid ${xvfb.pid})`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[browse] [xvfb] FAILED: ${msg}`);
+      console.error(`[browse] [xvfb] hint: ${xvfbInstallHint()}`);
+      process.exit(1);
+    }
+    process.on('exit', () => { try { xvfb?.close(); } catch { /* shutting down */ } });
+  } else if (process.env.BROWSE_HEADED === '1') {
+    console.log(`[browse] [xvfb] skipped: ${xvfbDecision.reason}`);
+  }
+
+  // Read env once — single source of truth for authToken (and other env).
+  // Threaded through launchHeaded, buildFetchHandler, and the state file
+  // write so all consumers see the same value. v1.34.x's module-level
+  // AUTH_TOKEN const was deleted in v1.35.0.0.
+  const envCfg = resolveConfigFromEnv();
+
+  // Launch browser (headless or headed with extension)
+  // BROWSE_HEADLESS_SKIP=1 skips browser launch entirely (for HTTP-only testing)
+  const skipBrowser = process.env.BROWSE_HEADLESS_SKIP === '1';
+  if (!skipBrowser) {
+    const headed = process.env.BROWSE_HEADED === '1';
+    if (headed) {
+      await browserManager.launchHeaded(envCfg.authToken);
+      console.log(`[browse] Launched headed Chromium with extension`);
+    } else {
+      await browserManager.launch();
+    }
+  }
+
+  const startTime = Date.now();
+
+  // ─── Build the request handlers via buildFetchHandler factory ───
+  // CLI path passes env-derived values; no beforeRoute hook. Phoenix uses
+  // the same factory with its own cfg + overlay hook.
+  const handle = buildFetchHandler({
+    ...envCfg,
+    browsePort: port,        // actual bound port (resolveConfigFromEnv default is 0)
+    browserManager,          // module-level instance, same as today
+    xvfb,
+    proxyBridge,
+    startTime,
+    ownsTerminalAgent: true, // CLI spawns terminal-agent.ts itself (see cli.ts:1037-1063)
+  });
 
   const server = Bun.serve({
     port,
     hostname: '127.0.0.1',
-    fetch: makeFetchHandler('local'),
+    fetch: handle.fetchLocal,
   });
 
   // Write state file (atomic: write .tmp then rename)
   const state: Record<string, unknown> = {
     pid: process.pid,
     port,
-    token: AUTH_TOKEN,
+    token: envCfg.authToken,
     startedAt: new Date().toISOString(),
     serverPath: path.resolve(import.meta.dir, 'server.ts'),
     binaryVersion: readVersionHash() || undefined,
     mode: browserManager.getConnectionMode(),
+    // D2 daemon-mismatch detection: CLI computes the same hash from its
+    // resolved flags and refuses if it differs from this stored value.
+    ...(process.env.BROWSE_CONFIG_HASH ? { configHash: process.env.BROWSE_CONFIG_HASH } : {}),
+    // Xvfb child PID + start-time + display so disconnect (or a future
+    // daemon launch on this state file) can validate-then-cleanup orphans
+    // without clobbering a recycled PID.
+    ...(xvfb ? { xvfbPid: xvfb.pid, xvfbStartTime: xvfb.startTime, xvfbDisplay: xvfb.display } : {}),
   };
-  const tmpFile = config.stateFile + '.tmp';
+  const tmpFile = tmpStatePath();
   fs.writeFileSync(tmpFile, JSON.stringify(state, null, 2), { mode: 0o600 });
   fs.renameSync(tmpFile, config.stateFile);
 
   browserManager.serverPort = port;
+
+  // ─── Opt-in session persistence (#778 class) ─────────────────
+  // BROWSE_PERSIST_STATE=1: restore cookies/storage/tabs from the last
+  // snapshot, then keep snapshotting on an interval. Launched mode only —
+  // the headed persistent profile owns its own state. The final snapshot at
+  // clean shutdown lives in buildFetchHandler's shutdown().
+  //
+  // Runs AFTER Bun.serve() + the state-file write, in the BACKGROUND:
+  // restore re-creates tabs sequentially with up-to-15s goto timeouts while
+  // the CLI's readiness probe gives up at 8s — one slow/unreachable saved
+  // URL must never make every `$B` command report "Server failed to start".
+  // Fire-and-forget: a restore failure is logged and never affects the
+  // daemon.
+  if (!skipBrowser && isSessionPersistEnabled() && browserManager.getConnectionMode() === 'launched') {
+    const sessionStatePath = path.join(config.stateDir, SESSION_STATE_FILE);
+    restoreSessionState(browserManager, sessionStatePath)
+      .then((restored) => {
+        if (restored) {
+          // Counts come from the deserialized snapshot itself — no extra
+          // saveState() round-trip against pages that may still be loading.
+          console.log(`[browse] Session state restored: ${restored.cookies.length} cookies / ${restored.pages.length} tabs (BROWSE_PERSIST_STATE=1)`);
+        } else {
+          console.log('[browse] Session persistence on; no prior state — fresh session (BROWSE_PERSIST_STATE=1)');
+        }
+      })
+      .catch((err: any) => {
+        console.warn(`[browse] SESSION_RESTORE_FAILED: ${err?.message ?? err}`);
+      });
+    let persistWarned = false;
+    // In-flight guard: never start a new snapshot while the previous one is
+    // still pending (a slow page.evaluate would otherwise pile up ticks).
+    let persistInFlight = false;
+    sessionPersistInterval = setInterval(() => {
+      // Shutdown gate (belt; shutdown()'s clearInterval is the suspenders):
+      // a tick that fires during browser teardown snapshots a degraded state
+      // (zero tabs) over the good final snapshot.
+      if (isShuttingDown) return;
+      if (persistInFlight) return; // skip the tick
+      persistInFlight = true;
+      persistSessionState(browserManager, sessionStatePath)
+        .catch((err: any) => {
+          // Warn once — a full disk must not spam the log every 30s, and a
+          // snapshot failure must never kill the daemon (R3).
+          if (!persistWarned) {
+            persistWarned = true;
+            console.warn(`[browse] SESSION_PERSIST_FAILED: ${err?.message ?? err} (further failures suppressed)`);
+          }
+        })
+        .finally(() => { persistInFlight = false; });
+    }, sessionPersistIntervalMs());
+    (sessionPersistInterval as any)?.unref?.();
+  }
 
   // Navigate to welcome page if in headed mode and still on about:blank
   if (browserManager.getConnectionMode() === 'headed') {
@@ -2042,55 +3271,28 @@ async function start() {
   console.log(`[browse] State file: ${config.stateFile}`);
   console.log(`[browse] Idle timeout: ${IDLE_TIMEOUT_MS / 1000}s`);
 
-  // initSidebarSession() ripped alongside the chat queue (it loaded
-  // chat.jsonl into memory and started the agent-health watchdog —
-  // both functions are gone). The Terminal pane manages its own state
-  // directly via terminal-agent.ts.
-
   // ─── Tunnel startup (optional) ────────────────────────────────
   // Start ngrok tunnel if BROWSE_TUNNEL=1 is set.  Uses the dual-listener
   // pattern: bind a dedicated tunnel listener on an ephemeral port and
   // point ngrok.forward() at IT, not the local daemon port.
-  if (process.env.BROWSE_TUNNEL === '1') {
+  if (process.env.BROWSE_TUNNEL === '1' && !isPairAgentEnabled()) {
+    console.error('[browse] BROWSE_TUNNEL=1 ignored: pair-agent is off. Enable once with: gstack-config set pair_agent on');
+  } else if (process.env.BROWSE_TUNNEL === '1') {
     const authtoken = resolveNgrokAuthtoken();
     if (!authtoken) {
       console.error('[browse] BROWSE_TUNNEL=1 but no NGROK_AUTHTOKEN found. Set it via env var or ~/.gstack/ngrok.env');
     } else {
-      let boundTunnel: ReturnType<typeof Bun.serve> | null = null;
-      try {
-        boundTunnel = Bun.serve({
-          port: 0,
-          hostname: '127.0.0.1',
-          fetch: makeFetchHandler('tunnel'),
-        });
-        const tunnelPort = boundTunnel.port;
-
-        const ngrok = await import('@ngrok/ngrok');
-        const domain = process.env.NGROK_DOMAIN;
-        const forwardOpts: any = { addr: tunnelPort, authtoken };
-        if (domain) forwardOpts.domain = domain;
-
-        tunnelListener = await ngrok.forward(forwardOpts);
-        tunnelUrl = tunnelListener.url();
-        tunnelServer = boundTunnel;
-        tunnelActive = true;
-
-        console.log(`[browse] Tunnel listener bound on 127.0.0.1:${tunnelPort}, ngrok → ${tunnelUrl}`);
-
-        // Update state file with tunnel URL
-        const stateContent = JSON.parse(fs.readFileSync(config.stateFile, 'utf-8'));
-        stateContent.tunnel = { url: tunnelUrl, domain: domain || null, startedAt: new Date().toISOString() };
-        const tmpState = config.stateFile + '.tmp';
-        fs.writeFileSync(tmpState, JSON.stringify(stateContent, null, 2), { mode: 0o600 });
-        fs.renameSync(tmpState, config.stateFile);
-      } catch (err: any) {
-        console.error(`[browse] Failed to start tunnel: ${err.message}`);
-        // Same cleanup as /tunnel/start's error path: tear down BOTH
-        // ngrok and the Bun listener so we don't leak an ngrok session
-        // if the error happened after ngrok.forward() resolved.
-        try { if (tunnelListener) await tunnelListener.close(); } catch {}
-        try { if (boundTunnel) boundTunnel.stop(true); } catch {}
-        tunnelListener = null;
+      // Shared startTunnel helper: binds the tunnel listener, opens ngrok,
+      // and on any failure tears down BOTH ngrok and the Bun listener so we
+      // don't leak an ngrok session if the error happened after
+      // ngrok.forward() resolved.
+      const started = await startTunnel({
+        fetchHandler: handle.fetchTunnel,
+        authtoken,
+        consent: 'pair_agent=on (isPairAgentEnabled gate, BROWSE_TUNNEL=1)',
+      });
+      if (!started.ok) {
+        console.error(`[browse] Failed to start tunnel: ${started.error.message}`);
       }
     }
   } else if (process.env.BROWSE_TUNNEL_LOCAL_ONLY === '1') {
@@ -2102,7 +3304,7 @@ async function start() {
       const boundTunnel = Bun.serve({
         port: 0,
         hostname: '127.0.0.1',
-        fetch: makeFetchHandler('tunnel'),
+        fetch: handle.fetchTunnel,
       });
       tunnelServer = boundTunnel;
       tunnelActive = true;
@@ -2110,7 +3312,7 @@ async function start() {
       console.log(`[browse] Tunnel listener bound (local-only test mode) on 127.0.0.1:${tunnelPort}`);
       const stateContent = JSON.parse(fs.readFileSync(config.stateFile, 'utf-8'));
       stateContent.tunnelLocalPort = tunnelPort;
-      const tmpState = config.stateFile + '.tmp';
+      const tmpState = tmpStatePath();
       fs.writeFileSync(tmpState, JSON.stringify(stateContent, null, 2), { mode: 0o600 });
       fs.renameSync(tmpState, config.stateFile);
     } catch (err: any) {
@@ -2119,16 +3321,38 @@ async function start() {
   }
 }
 
-start().catch((err) => {
-  console.error(`[browse] Failed to start: ${err.message}`);
-  // Write error to disk for the CLI to read — on Windows, the CLI can't capture
-  // stderr because the server is launched with detached: true, stdio: 'ignore'.
-  try {
-    const errorLogPath = path.join(config.stateDir, 'browse-startup-error.log');
-    fs.mkdirSync(config.stateDir, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(errorLogPath, `${new Date().toISOString()} ${err.message}\n${err.stack || ''}\n`, { mode: 0o600 });
-  } catch {
-    // stateDir may not exist — nothing more we can do
-  }
-  process.exit(1);
-});
+/**
+ * Test-only. Resets the module-level shutdown latch so a second test case
+ * can exercise shutdown() in the same process. Mirrors __resetRegistry in
+ * token-registry.ts. shutdown() short-circuits when isShuttingDown is true
+ * (see line near the start of shutdown), so without this, tests that call
+ * shutdown() more than once silently no-op after the first call.
+ *
+ * DO NOT call from production code. Defeats the shutdown re-entry guard,
+ * which can race process.exit with cfgBrowserManager.close() and the pkill /
+ * safeUnlinkQuiet side effects. The `__` prefix is the convention; nothing
+ * enforces it. If you find yourself reaching for this outside a test file,
+ * the right fix is to make isShuttingDown factory-scoped instead.
+ */
+export function __resetShuttingDown(): void {
+  isShuttingDown = false;
+}
+
+// Auto-kickoff only when this module is the entry point. Embedders
+// (gbrowser phoenix overlay) import { start, buildFetchHandler, ... }
+// without triggering the listener-binding side effects.
+if (import.meta.main) {
+  start().catch((err) => {
+    console.error(`[browse] Failed to start: ${err.message}`);
+    // Write error to disk for the CLI to read — on Windows, the CLI can't capture
+    // stderr because the server is launched with detached: true, stdio: 'ignore'.
+    try {
+      const errorLogPath = path.join(config.stateDir, 'browse-startup-error.log');
+      mkdirSecure(config.stateDir);
+      writeSecureFile(errorLogPath, `${new Date().toISOString()} ${err.message}\n${err.stack || ''}\n`);
+    } catch {
+      // stateDir may not exist — nothing more we can do
+    }
+    process.exit(1);
+  });
+}

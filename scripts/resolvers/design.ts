@@ -1,5 +1,5 @@
-import type { TemplateContext } from './types';
-import { AI_SLOP_BLACKLIST, OPENAI_HARD_REJECTIONS, OPENAI_LITMUS_CHECKS } from './constants';
+import { type TemplateContext, toShellPath } from './types';
+import { AI_SLOP_BLACKLIST, OPENAI_HARD_REJECTIONS, OPENAI_LITMUS_CHECKS, CODEX_WEB_SEARCH_FLAG } from './constants';
 
 export function generateDesignReviewLite(ctx: TemplateContext): string {
   const litmusList = OPENAI_LITMUS_CHECKS.map((item, i) => `${i + 1}. ${item}`).join(' ');
@@ -10,7 +10,7 @@ export function generateDesignReviewLite(ctx: TemplateContext): string {
 7. **Codex design voice** (optional, automatic if available):
 
 \`\`\`bash
-which codex 2>/dev/null && echo "CODEX_AVAILABLE" || echo "CODEX_NOT_AVAILABLE"
+command -v codex >/dev/null 2>&1 && echo "CODEX_AVAILABLE" || echo "CODEX_NOT_AVAILABLE"
 \`\`\`
 
 If Codex is available, run a lightweight design check on the diff:
@@ -18,7 +18,7 @@ If Codex is available, run a lightweight design check on the diff:
 \`\`\`bash
 TMPERR_DRL=$(mktemp /tmp/codex-drl-XXXXXXXX)
 _REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
-codex exec "Review the git diff on this branch. Run 7 litmus checks (YES/NO each): ${litmusList} Flag any hard rejections: ${rejectionList} 5 most important design findings only. Reference file:line." -C "$_REPO_ROOT" -s read-only -c 'model_reasoning_effort="high"' --enable web_search_cached < /dev/null 2>"$TMPERR_DRL"
+codex exec "Review the git diff on this branch. Run 7 litmus checks (YES/NO each): ${litmusList} Flag any hard rejections: ${rejectionList} 5 most important design findings only. Reference file:line." -C "$_REPO_ROOT" -s read-only -c 'model_reasoning_effort="high"' ${CODEX_WEB_SEARCH_FLAG} < /dev/null 2>"$TMPERR_DRL"
 \`\`\`
 
 Use a 5-minute timeout (\`timeout: 300000\`). After the command completes, read stderr:
@@ -512,7 +512,7 @@ The screenshot file at \`/tmp/gstack-sketch.png\` can be referenced by downstrea
 After the wireframe is approved, offer outside design perspectives:
 
 \`\`\`bash
-which codex 2>/dev/null && echo "CODEX_AVAILABLE" || echo "CODEX_NOT_AVAILABLE"
+command -v codex >/dev/null 2>&1 && echo "CODEX_AVAILABLE" || echo "CODEX_NOT_AVAILABLE"
 \`\`\`
 
 If Codex is available, use AskUserQuestion:
@@ -527,7 +527,7 @@ If user chooses A, launch both voices simultaneously:
 \`\`\`bash
 TMPERR_SKETCH=$(mktemp /tmp/codex-sketch-XXXXXXXX)
 _REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
-codex exec "For this product approach, provide: a visual thesis (one sentence — mood, material, energy), a content plan (hero → support → detail → CTA), and 2 interaction ideas that change page feel. Apply beautiful defaults: composition-first, brand-first, cardless, poster not document. Be opinionated." -C "$_REPO_ROOT" -s read-only -c 'model_reasoning_effort="medium"' --enable web_search_cached < /dev/null 2>"$TMPERR_SKETCH"
+codex exec "For this product approach, provide: a visual thesis (one sentence — mood, material, energy), a content plan (hero → support → detail → CTA), and 2 interaction ideas that change page feel. Apply beautiful defaults: composition-first, brand-first, cardless, poster not document. Be opinionated." -C "$_REPO_ROOT" -s read-only -c 'model_reasoning_effort="medium"' ${CODEX_WEB_SEARCH_FLAG} < /dev/null 2>"$TMPERR_SKETCH"
 \`\`\`
 Use a 5-minute timeout (\`timeout: 300000\`). After completion: \`cat "$TMPERR_SKETCH" && rm -f "$TMPERR_SKETCH"\`
 
@@ -688,7 +688,7 @@ ${optInSection}
 
 **Check Codex availability:**
 \`\`\`bash
-which codex 2>/dev/null && echo "CODEX_AVAILABLE" || echo "CODEX_NOT_AVAILABLE"
+command -v codex >/dev/null 2>&1 && echo "CODEX_AVAILABLE" || echo "CODEX_NOT_AVAILABLE"
 \`\`\`
 
 **If Codex is available**, launch both voices simultaneously:
@@ -697,7 +697,7 @@ which codex 2>/dev/null && echo "CODEX_AVAILABLE" || echo "CODEX_NOT_AVAILABLE"
 \`\`\`bash
 TMPERR_DESIGN=$(mktemp /tmp/codex-design-XXXXXXXX)
 _REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repo" >&2; exit 1; }
-codex exec "${escapedCodexPrompt}" -C "$_REPO_ROOT" -s read-only -c 'model_reasoning_effort="${reasoningEffort}"' --enable web_search_cached < /dev/null 2>"$TMPERR_DESIGN"
+codex exec "${escapedCodexPrompt}" -C "$_REPO_ROOT" -s read-only -c 'model_reasoning_effort="${reasoningEffort}"' ${CODEX_WEB_SEARCH_FLAG} < /dev/null 2>"$TMPERR_DESIGN"
 \`\`\`
 Use a 5-minute timeout (\`timeout: 300000\`). After the command completes, read stderr:
 \`\`\`bash
@@ -792,7 +792,7 @@ export function generateDesignSetup(ctx: TemplateContext): string {
 _ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
 D=""
 [ -n "$_ROOT" ] && [ -x "$_ROOT/${ctx.paths.localSkillRoot}/design/dist/design" ] && D="$_ROOT/${ctx.paths.localSkillRoot}/design/dist/design"
-[ -z "$D" ] && D="$HOME${ctx.paths.designDir.replace(/^~/, '')}/design"
+[ -z "$D" ] && D="${toShellPath(ctx.paths.designDir)}/design"
 if [ -x "$D" ]; then
   echo "DESIGN_READY: $D"
 else
@@ -800,7 +800,7 @@ else
 fi
 B=""
 [ -n "$_ROOT" ] && [ -x "$_ROOT/${ctx.paths.localSkillRoot}/browse/dist/browse" ] && B="$_ROOT/${ctx.paths.localSkillRoot}/browse/dist/browse"
-[ -z "$B" ] && B="$HOME${ctx.paths.browseDir.replace(/^~/, '')}/browse"
+[ -z "$B" ] && B="${toShellPath(ctx.paths.browseDir)}/browse"
 if [ -x "$B" ]; then
   echo "BROWSE_READY: $B"
 else
@@ -837,7 +837,7 @@ export function generateDesignMockup(ctx: TemplateContext): string {
 _ROOT=$(git rev-parse --show-toplevel 2>/dev/null)
 D=""
 [ -n "$_ROOT" ] && [ -x "$_ROOT/${ctx.paths.localSkillRoot}/design/dist/design" ] && D="$_ROOT/${ctx.paths.localSkillRoot}/design/dist/design"
-[ -z "$D" ] && D="$HOME${ctx.paths.designDir.replace(/^~/, '')}/design"
+[ -z "$D" ] && D="${toShellPath(ctx.paths.designDir)}/design"
 [ -x "$D" ] && echo "DESIGN_READY" || echo "DESIGN_NOT_AVAILABLE"
 \`\`\`
 
@@ -891,8 +891,11 @@ If the JSON contains \`"regenerated": true\`:
 1. Read \`regenerateAction\` (or \`remixSpec\` for remix requests)
 2. Generate new variants with \`$D iterate\` or \`$D variants\` using updated brief
 3. Create new board with \`$D compare\`
-4. POST the new HTML to the running server via \`curl -X POST http://localhost:PORT/api/reload -H 'Content-Type: application/json' -d '{"html":"$_DESIGN_DIR/design-board.html"}'\`
-   (parse the port from stderr: look for \`SERVE_STARTED: port=XXXXX\`)
+4. POST the new HTML to the running board. Parse the board URL from stderr
+   (\`BOARD_URL: http://127.0.0.1:N/boards/<id>/\` — the daemon path) or fall
+   back to the legacy port (\`SERVE_STARTED: port=N\` — only emitted under
+   \`--no-daemon\`, hits \`/api/reload\` root). Daemon path:
+   \`curl -X POST "\${BOARD_URL}api/reload" -H 'Content-Type: application/json' -d '{"html":"$_DESIGN_DIR/design-board.html"}'\`
 5. Board auto-refreshes in the same tab
 
 If \`"regenerated": false\`: proceed with the approved variant.
@@ -919,8 +922,12 @@ This command generates the board HTML, starts an HTTP server on a random port,
 and opens it in the user's default browser. **Run it in the background** with \`&\`
 because the server needs to stay running while the user interacts with the board.
 
-Parse the port from stderr output: \`SERVE_STARTED: port=XXXXX\`. You need this
-for the board URL and for reloading during regeneration cycles.
+Parse the board URL from stderr output. Default daemon path:
+\`BOARD_URL: http://127.0.0.1:N/boards/<id>/\` (already includes the per-board
+path; use this for the AskUserQuestion URL AND as the base for the reload
+endpoint). Legacy \`--no-daemon\` path emits \`SERVE_STARTED: port=XXXXX\` and
+serves a single board at \`/\`, with reload at \`/api/reload\` — only relevant
+when an external caller explicitly passes \`--no-daemon\`.
 
 **PRIMARY WAIT: AskUserQuestion with board URL**
 
@@ -928,10 +935,13 @@ After the board is serving, use AskUserQuestion to wait for the user. Include th
 board URL so they can click it if they lost the browser tab:
 
 "I've opened a comparison board with the design variants:
-http://127.0.0.1:<PORT>/ — Rate them, leave comments, remix
+<BOARD_URL> — Rate them, leave comments, remix
 elements you like, and click Submit when you're done. Let me know when you've
 submitted your feedback (or paste your preferences here). If you clicked
 Regenerate or Remix on the board, tell me and I'll generate new variants."
+
+Substitute \`<BOARD_URL>\` with the URL parsed from stderr (the daemon path
+emits \`BOARD_URL: http://127.0.0.1:N/boards/<id>/\`).
 
 **Do NOT use AskUserQuestion to ask which variant the user prefers.** The comparison
 board IS the chooser. AskUserQuestion is just the blocking wait mechanism.
@@ -976,8 +986,13 @@ the approved variant.
 2. If \`regenerateAction\` is \`"remix"\`, read \`remixSpec\` (e.g. \`{"layout":"A","colors":"B"}\`)
 3. Generate new variants with \`$D iterate\` or \`$D variants\` using updated brief
 4. Create new board: \`$D compare --images "..." --output "$_DESIGN_DIR/design-board.html"\`
-5. Reload the board in the user's browser (same tab):
-   \`curl -s -X POST http://127.0.0.1:PORT/api/reload -H 'Content-Type: application/json' -d '{"html":"$_DESIGN_DIR/design-board.html"}'\`
+5. Reload the board in the user's browser (same tab) — the URL is per-board
+   under daemon mode, so use \`<BOARD_URL>\` (from the \`BOARD_URL:\` stderr
+   line) as the base:
+   \`curl -s -X POST "\${BOARD_URL}api/reload" -H 'Content-Type: application/json' -d '{"html":"$_DESIGN_DIR/design-board.html"}'\`
+   Under \`--no-daemon\` the reload endpoint is \`/api/reload\` at the legacy
+   port; this path only matters if the caller explicitly opted out of the
+   daemon.
 6. The board auto-refreshes. **AskUserQuestion again** with the same board URL to
    wait for the next round of feedback. Repeat until \`feedback.json\` appears.
 

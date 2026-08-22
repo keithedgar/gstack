@@ -38,7 +38,7 @@ You are running the `/review` workflow. Analyze the current branch's diff agains
 
 1. Run `git branch --show-current` to get the current branch.
 2. If on the base branch, output: **"Nothing to review — you're on the base branch or have no changes against it."** and stop.
-3. Run `git fetch origin <base> --quiet && git diff origin/<base> --stat` to check if there's a diff. If no diff, output the same message and stop.
+3. Run `git fetch origin <base> --quiet && DIFF_BASE=$(git merge-base origin/<base> HEAD) && git diff "$DIFF_BASE" --stat` to check if there's a diff. If no diff, output the same message and stop.
 
 ---
 
@@ -48,7 +48,7 @@ You are running the `/review` workflow. Analyze the current branch's diff agains
 
 ## Step 2: Read the checklist
 
-Read `.claude/skills/review/checklist.md`.
+Read `~/.claude/skills/gstack/review/checklist.md`.
 
 **If the file cannot be read, STOP and report the error.** Do not proceed without the checklist.
 
@@ -56,7 +56,7 @@ Read `.claude/skills/review/checklist.md`.
 
 ## Step 2.5: Check for Greptile review comments
 
-Read `.claude/skills/review/greptile-triage.md` and follow the fetch, filter, classify, and **escalation detection** steps.
+Read `~/.claude/skills/gstack/review/greptile-triage.md` and follow the fetch, filter, classify, and **escalation detection** steps.
 
 **If no PR exists, `gh` fails, API returns an error, or there are zero Greptile comments:** Skip this step silently. Greptile integration is additive — the review works without it.
 
@@ -72,7 +72,14 @@ Fetch the latest base branch to avoid false positives from stale local state:
 git fetch origin <base> --quiet
 ```
 
-Run `git diff origin/<base>` to get the full diff. This includes both committed and uncommitted changes against the latest base branch.
+Compute the merge base, then diff the working tree against that point:
+
+```bash
+DIFF_BASE=$(git merge-base origin/<base> HEAD)
+git diff "$DIFF_BASE"
+```
+
+This includes both committed and uncommitted changes while excluding commits that landed on the base branch after this branch was created.
 
 ## Step 3.4: Workspace-aware queue status (advisory)
 
@@ -82,7 +89,7 @@ Check whether this PR's claimed VERSION still points at a free slot in the queue
 BRANCH_VERSION=$(git show HEAD:VERSION 2>/dev/null | tr -d '\r\n[:space:]' || echo "")
 BASE_BRANCH=$(gh pr view --json baseRefName -q .baseRefName 2>/dev/null || echo main)
 BASE_VERSION=$(git show origin/$BASE_BRANCH:VERSION 2>/dev/null | tr -d '\r\n[:space:]' || echo "")
-QUEUE_JSON=$(bun run bin/gstack-next-version \
+QUEUE_JSON=$(bun run ~/.claude/skills/gstack/bin/gstack-next-version \
   --base "$BASE_BRANCH" \
   --bump patch \
   --current-version "$BASE_VERSION" 2>/dev/null || echo '{"offline":true}')
