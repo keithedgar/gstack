@@ -10,6 +10,7 @@
 
 import { validateSkill } from '../test/helpers/skill-parser';
 import { discoverTemplates, discoverSkillFiles } from './discover-skills';
+import { getHostConfig } from '../hosts/index';
 import * as fs from 'fs';
 import * as path from 'path';
 import { execSync } from 'child_process';
@@ -65,14 +66,25 @@ for (const file of SKILL_FILES) {
 console.log('\n  Templates:');
 const TEMPLATES = discoverTemplates(ROOT);
 
+// Skills the Claude host deliberately does not generate (hosts/claude.ts
+// skipSkills — e.g. claude/, the outside-voice skill that only exists for
+// non-Claude hosts). Their SKILL.md is absent by design, so demanding one
+// here would fail skill:check on a correct tree.
+const CLAUDE_SKIPPED = new Set(getHostConfig('claude').generation.skipSkills ?? []);
+
 for (const { tmpl, output } of TEMPLATES) {
   const tmplPath = path.join(ROOT, tmpl);
   const outPath = path.join(ROOT, output);
+  const skillDir = path.dirname(output);
   if (!fs.existsSync(tmplPath)) {
     console.log(`  \u26a0\ufe0f  ${output.padEnd(30)} — no template`);
     continue;
   }
   if (!fs.existsSync(outPath)) {
+    if (CLAUDE_SKIPPED.has(skillDir)) {
+      console.log(`  \u23ed\ufe0f  ${output.padEnd(30)} — not generated for Claude (skipSkills)`);
+      continue;
+    }
     hasErrors = true;
     console.log(`  \u274c ${output.padEnd(30)} — generated file missing! Run: bun run gen:skill-docs`);
     continue;

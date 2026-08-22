@@ -18,7 +18,45 @@ CACHE_FILE="$STATE_DIR/last-update-check"
 MARKER_FILE="$STATE_DIR/just-upgraded-from"
 SNOOZE_FILE="$STATE_DIR/update-snoozed"
 VERSION_FILE="$GSTACK_DIR/VERSION"
-REMOTE_URL="${GSTACK_REMOTE_URL:-https://raw.githubusercontent.com/garrytan/gstack/main/VERSION}"
+# ─── Remote VERSION URL ──────────────────────────────────────
+# Derived from this checkout's origin so a FORK checks itself. Hardcoding
+# upstream makes every fork permanently "out of date": the banner never
+# clears, because /gstack-upgrade pulls origin (the fork) and the fork's
+# VERSION never becomes upstream's.
+# Falls back to upstream when origin can't be read (tarball/zip install).
+gstack_remote_version_url() {
+  local origin owner_repo branch
+  origin="$(git -C "$GSTACK_DIR" remote get-url origin 2>/dev/null || true)"
+  [ -n "$origin" ] || return 1
+  case "$origin" in
+    git@github.com:*)          owner_repo="${origin#git@github.com:}" ;;
+    ssh://git@github.com/*)    owner_repo="${origin#ssh://git@github.com/}" ;;
+    https://github.com/*)      owner_repo="${origin#https://github.com/}" ;;
+    http://github.com/*)       owner_repo="${origin#http://github.com/}" ;;
+    *)                         return 1 ;;   # non-GitHub remote — caller falls back
+  esac
+  owner_repo="${owner_repo%.git}"
+  owner_repo="${owner_repo%/}"
+  # owner/repo only — anything else means we mis-parsed; bail rather than guess.
+  case "$owner_repo" in
+    */*/*|*/) return 1 ;;
+    */*) ;;
+    *) return 1 ;;
+  esac
+  branch="$(git -C "$GSTACK_DIR" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+  branch="${branch#origin/}"
+  [ -n "$branch" ] || branch="main"
+  echo "https://raw.githubusercontent.com/${owner_repo}/${branch}/VERSION"
+}
+
+REMOTE_URL="${GSTACK_REMOTE_URL:-$(gstack_remote_version_url || echo "https://raw.githubusercontent.com/garrytan/gstack/main/VERSION")}"
+
+# Introspection hook — prints the resolved URL and exits. Used by the test
+# suite so the derivation can be asserted without a network round-trip.
+if [ "${1:-}" = "--print-remote-url" ]; then
+  echo "$REMOTE_URL"
+  exit 0
+fi
 
 # ─── Force flag (busts cache + snooze for standalone /gstack-upgrade) ──
 if [ "${1:-}" = "--force" ]; then

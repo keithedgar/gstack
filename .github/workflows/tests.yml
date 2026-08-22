@@ -1,0 +1,47 @@
+# Free test lane — no API keys, no paid runners, works on forks.
+#
+# Everything else in .github/workflows/ runs on `ubicloud-*` runners and pulls a
+# CI image from ghcr.io/<repo>/ci, so a fork gets no CI at all until it wires up
+# Ubicloud and three model API keys. This lane runs the suite that needs none of
+# that, on GitHub-hosted runners.
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: unit + skill:check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.0'
+
+      # team-mode / brain tests shell out to `git commit`, which fails hard
+      # without an identity ("unable to auto-detect email address").
+      - name: Give git an identity
+        run: |
+          git config --global user.email "ci@gstack.invalid"
+          git config --global user.name "gstack CI"
+
+      - run: bun install --frozen-lockfile
+
+      - name: Generated skill docs are present and fresh
+        run: bun run skill:check
+
+      # The default lane. Browser-integration files run separately via
+      # `bun run test:browser` — they force-exit the process on teardown, which
+      # truncates a shared run (see test/test-lanes.test.ts).
+      - name: Unit lane
+        run: bun run test

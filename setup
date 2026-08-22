@@ -379,6 +379,12 @@ link_claude_skill_dirs() {
       dir_name="$(basename "$skill_dir")"
       # Skip node_modules
       [ "$dir_name" = "node_modules" ] && continue
+      # Skip alias symlinks (connect-chrome -> open-gstack-browser). The glob
+      # follows them, so the aliased SKILL.md would be linked a second time
+      # under the SAME name: field — two skill entries claiming one name, and a
+      # real directory sitting where the backwards-compat alias symlink belongs.
+      # The alias is created explicitly after this function returns.
+      [ -L "${skill_dir%/}" ] && continue
       # Use frontmatter name: if present (e.g., run-tests/ with name: test → symlink as "test")
       skill_name=$(grep -m1 '^name:' "$skill_dir/SKILL.md" 2>/dev/null | sed 's/^name:[[:space:]]*//' | tr -d '[:space:]')
       [ -z "$skill_name" ] && skill_name="$dir_name"
@@ -795,6 +801,13 @@ if [ "$INSTALL_CLAUDE" -eq 1 ]; then
     if [ "$SKILL_PREFIX" -eq 1 ]; then
       _OGB_LINK="$INSTALL_SKILLS_DIR/gstack-connect-chrome"
     fi
+    # Older installs left a real directory here (the alias symlink was skipped
+    # because the path already existed). Replace it with the alias.
+    if [ -d "$_OGB_LINK" ] && [ ! -L "$_OGB_LINK" ] && [ -L "$_OGB_LINK/SKILL.md" ]; then
+      case "$(readlink "$_OGB_LINK/SKILL.md" 2>/dev/null || true)" in
+        *gstack*) rm -rf "$_OGB_LINK" ;;
+      esac
+    fi
     if [ -L "$_OGB_LINK" ] || [ ! -e "$_OGB_LINK" ]; then
       ln -snf "gstack/open-gstack-browser" "$_OGB_LINK"
     fi
@@ -829,6 +842,13 @@ if [ "$INSTALL_CLAUDE" -eq 1 ]; then
     _OGB_LINK="$INSTALL_SKILLS_DIR/connect-chrome"
     if [ "$SKILL_PREFIX" -eq 1 ]; then
       _OGB_LINK="$INSTALL_SKILLS_DIR/gstack-connect-chrome"
+    fi
+    # Older installs left a real directory here (the alias symlink was skipped
+    # because the path already existed). Replace it with the alias.
+    if [ -d "$_OGB_LINK" ] && [ ! -L "$_OGB_LINK" ] && [ -L "$_OGB_LINK/SKILL.md" ]; then
+      case "$(readlink "$_OGB_LINK/SKILL.md" 2>/dev/null || true)" in
+        *gstack*) rm -rf "$_OGB_LINK" ;;
+      esac
     fi
     if [ -L "$_OGB_LINK" ] || [ ! -e "$_OGB_LINK" ]; then
       ln -snf "gstack/open-gstack-browser" "$_OGB_LINK"
