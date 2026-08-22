@@ -1,5 +1,32 @@
 # Changelog
 
+## [1.20.1.0] - 2026-08-22
+
+## **`bun run test` exited 0 while 109 tests were failing. Both causes are fixed, and the failures are now visible.**
+
+Two independent defects stacked into one silent lie. `--ignore` is not a Bun flag — Bun's is `--path-ignore-patterns` — and Bun accepts the unknown flag without complaint, so the five eval-suite exclusions in the `test` script never excluded anything. Separately, seven files under `browse/test/` end their `afterAll` with `setTimeout(() => process.exit(0), 500)`, a workaround for a Chromium handle `bm.close()` cannot reliably release. Bun runs every test file in one process, so the first of those seven to finish killed the entire run with a **success** code, wherever it happened to be. Measured on a clean checkout: exit 0, 17 failures printed, no `Ran N tests` summary, and the run simply stopping mid-log. Reproduced identically twice.
+
+The fix is lane separation. `test` excludes the seven force-exiting files and reports a truthful exit code; `test:browser` runs them one file per process, where the watchdog can only ever end its own run; `test:all` runs both. `test/test-lanes.test.ts` pins the arrangement — a new file that grows a watchdog fails the lane test rather than silently poisoning the unit lane, and a bare `--ignore` can never come back.
+
+With the lane honest, the suite reports **109 failures across 19 files**. They were always there. The largest cluster is 73 assertions in `browse/test/sidebar-ux.test.ts` against functions in `extension/sidepanel.js` that were removed when the chat queue became the terminal REPL in v1.14 — six versions of red that nothing was listening for. Triage is deliberately not in this release; making the failures visible is.
+
+Four smaller defects found in the same pass:
+
+- **`bun run skill:check` always exited 1 on a correct tree.** `hosts/claude.ts` deliberately skips generating `claude/SKILL.md` (the outside-voice skill exists for non-Claude hosts), but the checker demanded an output for every `.tmpl` it discovered. It now reads the same `skipSkills` list the generator does, so the repo's own health check can finally be used as a gate — and is, in the new workflow.
+- **Forks could never be up to date.** `gstack-update-check` fetched upstream's `VERSION` regardless of which repo was installed, so a fork compares its version to someone else's forever while `/gstack-upgrade` pulls `origin`. The URL is now derived from the checkout's own `origin` (https and ssh forms), falling back to upstream only when `origin` is absent or not GitHub. Covered by five tests via a new `--print-remote-url` introspection flag.
+- **`setup` registered two skills under one name.** `connect-chrome` is a symlink to `open-gstack-browser`; the install glob follows symlinks, so both were linked under the `name:` field they share, and the real directory that created sat exactly where the backwards-compat alias symlink belonged — so the alias step skipped itself. Symlinked skill dirs are now skipped during linking, and a stale directory from an older install is replaced.
+- **No workflow ran the free suite.** Every existing workflow needs `ubicloud-*` runners, a `ghcr.io/<repo>/ci` image, and three model API keys, so a fork gets no CI at all. `.github/workflows/tests.yml` runs `skill:check` plus the unit lane on GitHub-hosted `ubuntu-latest`, with a git identity configured for the tests that shell out to `git commit`.
+
+### The numbers that matter
+
+| Surface | Before | After |
+|---|---|---|
+| `bun run test` exit code, suite failing | `0` | `1` |
+| Failures surfaced by that run | 17, then truncated | 109 across 19 files |
+| `bun run skill:check` on a clean tree | exit 1 | exit 0 |
+| Workflows that run without paid runners or API keys | 0 of 8 | 1 of 9 |
+| Skills registered per install | 46 entries, one name claimed twice | 45, no duplicates |
+
 ## [1.20.0.0] - 2026-04-28
 
 ## **Browser-skills land. `/scrape <intent>` first call drives the page; second call runs the codified script in 200ms.**
