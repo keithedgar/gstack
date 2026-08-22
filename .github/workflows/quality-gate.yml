@@ -28,7 +28,7 @@ concurrency:
 
 jobs:
   quality:
-    runs-on: ubicloud-standard-8
+    runs-on: ${{ vars.GSTACK_LINUX_RUNNER || 'ubicloud-standard-8' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4

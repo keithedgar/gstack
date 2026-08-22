@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   dependency-review:
-    runs-on: ubicloud-standard-8
+    runs-on: ${{ vars.GSTACK_LINUX_RUNNER || 'ubicloud-standard-8' }}
     timeout-minutes: 10
     permissions:
       contents: read
