@@ -50,8 +50,68 @@ CACHE_FILE="$STATE_DIR/last-update-check"
 MARKER_FILE="$STATE_DIR/just-upgraded-from"
 SNOOZE_FILE="$STATE_DIR/update-snoozed"
 VERSION_FILE="$GSTACK_DIR/VERSION"
-REMOTE_URL="${GSTACK_REMOTE_URL:-https://raw.githubusercontent.com/garrytan/gstack/main/VERSION}"
-REMOTE_REPO="${GSTACK_REMOTE_REPO:-https://github.com/garrytan/gstack.git}"
+# ─── Remote defaults follow this checkout's own origin ───────────────
+# A fork installed from its own remote must check ITSELF. Hardcoding upstream
+# makes every fork permanently "out of date" — the banner compares fork VERSION
+# to upstream's, while /gstack-upgrade pulls origin, so the prompt never clears
+# no matter how many times it is accepted.
+#
+# Echoes "<version-url> <git-url>", or nothing when origin is missing or is not
+# GitHub. Never fails: the ERR trap above turns any non-zero into CHECK_FAILED,
+# and "I could not read a remote" is a fallback, not a crash.
+_derive_origin_remote() {
+  local origin owner_repo branch
+  origin="$(git -C "$GSTACK_DIR" remote get-url origin 2>/dev/null || true)"
+  [ -n "$origin" ] || return 0
+  case "$origin" in
+    git@github.com:*)       owner_repo="${origin#git@github.com:}" ;;
+    ssh://git@github.com/*) owner_repo="${origin#ssh://git@github.com/}" ;;
+    https://github.com/*)   owner_repo="${origin#https://github.com/}" ;;
+    http://github.com/*)    owner_repo="${origin#http://github.com/}" ;;
+    *)                      return 0 ;;   # non-GitHub remote — fall back, do not guess
+  esac
+  owner_repo="${owner_repo%.git}"
+  owner_repo="${owner_repo%/}"
+  case "$owner_repo" in
+    */*/*|*/|/*) return 0 ;;              # mis-parsed — fall back
+    */*) ;;
+    *) return 0 ;;
+  esac
+  # Which branch does this install actually pull? The tracking branch of the
+  # checked-out HEAD is the honest answer — origin/HEAD is a clone-time guess
+  # that points wherever the source repo's HEAD happened to be.
+  branch="$(git -C "$GSTACK_DIR" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' 2>/dev/null || true)"
+  case "$branch" in
+    origin/*) branch="${branch#origin/}" ;;
+    *)        branch="" ;;                # tracks another remote, or nothing
+  esac
+  if [ -z "$branch" ]; then
+    branch="$(git -C "$GSTACK_DIR" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+    branch="${branch#origin/}"
+  fi
+  [ -n "$branch" ] || branch="main"
+  echo "https://raw.githubusercontent.com/${owner_repo}/${branch}/VERSION https://github.com/${owner_repo}.git"
+  return 0
+}
+
+_ORIGIN_REMOTE="$(_derive_origin_remote)"
+_ORIGIN_VERSION_URL=""
+_ORIGIN_GIT_URL=""
+if [ -n "$_ORIGIN_REMOTE" ]; then
+  _ORIGIN_VERSION_URL="${_ORIGIN_REMOTE%% *}"
+  _ORIGIN_GIT_URL="${_ORIGIN_REMOTE##* }"
+fi
+
+REMOTE_URL="${GSTACK_REMOTE_URL:-${_ORIGIN_VERSION_URL:-https://raw.githubusercontent.com/garrytan/gstack/main/VERSION}}"
+REMOTE_REPO="${GSTACK_REMOTE_REPO:-${_ORIGIN_GIT_URL:-https://github.com/garrytan/gstack.git}}"
+
+# Introspection hook — prints the resolved remotes and exits. Lets the test
+# suite assert the derivation without a network round-trip.
+if [ "${1:-}" = "--print-remote-url" ]; then
+  echo "$REMOTE_URL"
+  echo "$REMOTE_REPO"
+  exit 0
+fi
 
 # ─── Force flag (busts cache + snooze for standalone /gstack-upgrade) ──
 if [ "${1:-}" = "--force" ]; then
